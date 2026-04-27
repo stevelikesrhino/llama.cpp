@@ -415,7 +415,14 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         } else
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
         {
-            CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
+            size_t copy_size = ggml_nbytes(src0);
+#if defined(BLACKWELL_MMA_AVAILABLE) // This is for proper copying of NVFP4 blocks with tensor scales
+            if (src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(ggml_cuda_info().devices[ctx.device].cc)) {
+                copy_size = ggml_cuda_nvfp4_tensor_alloc_size(src0);
+                GGML_ASSERT(copy_size == ggml_cuda_nvfp4_tensor_alloc_size(src1));
+            }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+            CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, copy_size, cudaMemcpyDeviceToDevice, main_stream));
         }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {

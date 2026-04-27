@@ -257,9 +257,14 @@ static const char * cu_get_error_str(CUresult err) {
 #define AMPERE_MMA_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 
-#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && \
+        (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN))
 #    define BLACKWELL_MMA_AVAILABLE
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && BLACKWELL <= __CUDA_ARCH__ < RUBIN
+
+#if defined(BLACKWELL_MMA_AVAILABLE)
+#include "repack-mma.cuh"
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
 
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define CP_ASYNC_AVAILABLE
@@ -1485,5 +1490,61 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
     const void * gate_bias = nullptr;
+    const float * scale_activation = nullptr;
+    int64_t scale_activation_ne = 0;
     ggml_glu_op glu_op;
 };
+
+static inline const ggml_tensor * ggml_cuda_mul_mat_weight_scale(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * scale = src0 != nullptr ? src0->src[0] : nullptr;
+    if (scale != nullptr && scale->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    if (scale != nullptr && strstr(ggml_get_name(scale), ".scale") == nullptr) {
+        return nullptr;
+    }
+    if (scale != nullptr && scale->buffer != nullptr && ggml_backend_buffer_is_host(scale->buffer)) {
+        return nullptr;
+    }
+    if (scale != nullptr && ggml_is_scalar(scale)) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+        if (src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+            return nullptr;
+        }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+        float weight_scale = 0.0f;
+        memcpy(&weight_scale, &src0->op_params[0], sizeof(weight_scale));
+        if (weight_scale > 0.0f) {
+            scale = nullptr;
+        }
+    }
+    return scale;
+}
+
+static inline const ggml_tensor * ggml_cuda_mul_mat_input_scale(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * scale = src0 != nullptr ? src0->src[1] : nullptr;
+    if (scale != nullptr && scale->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    if (scale != nullptr && strstr(ggml_get_name(scale), ".input_scale") == nullptr) {
+        return nullptr;
+    }
+    if (scale != nullptr && scale->buffer != nullptr && ggml_backend_buffer_is_host(scale->buffer)) {
+        return nullptr;
+    }
+    if (scale != nullptr && ggml_is_scalar(scale)) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+        if (src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+            return nullptr;
+        }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+        float input_scale = 0.0f;
+        memcpy(&input_scale, &src0->op_params[1], sizeof(input_scale));
+        if (input_scale > 0.0f) {
+            scale = nullptr; // scalar input scale is already in the Blackwell header
+        }
+    }
+    return scale;
+}
