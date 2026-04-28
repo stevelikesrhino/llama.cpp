@@ -1106,9 +1106,9 @@ static __device__ __forceinline__ void load_nvfp4_tileB(
 
 template <int mmq_x, int mmq_y, bool need_check>
 static __device__ __forceinline__ void vec_dot_nvfp4_nvfp4_mma(
-        const char * __restrict__ x, const int offset_x, const int stride_row_x,
+        const block_nvfp4_blackwell * __restrict__ x_blocks, const int stride_row_x,
         const block_nvfp4_mmq * __restrict__ y, float * __restrict__ sum,
-        const int k00, const int i_max, const float scale_activation = 1.0f) {
+        const int k00, const int i_max, const float tensor_scale) {
     typedef tile<16, 8, int>   tile_A;
     typedef tile<8, 8, int>    tile_B;
     typedef tile<16, 8, float> tile_C;
@@ -1122,10 +1122,7 @@ static __device__ __forceinline__ void vec_dot_nvfp4_nvfp4_mma(
     const int ty = threadIdx.y;
     const int ty_ntx_mod = ty % ntx;
     const int ty_ntx_div = ty / ntx;
-    const block_nvfp4_blackwell_tensor * __restrict__ x_tensor = (const block_nvfp4_blackwell_tensor *) x;
-    const block_nvfp4_blackwell * __restrict__ x_blocks = x_tensor->tiles + offset_x;
     const block_nvfp4_mmq * __restrict__ y_blocks = y + ty_ntx_mod * tile_C::J;
-    const float tensor_scale = x_tensor->weight_scale * x_tensor->input_scale * scale_activation;
 
 #pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 16) {
@@ -3558,9 +3555,7 @@ static __device__ __forceinline__ void process_nvfp4_tiles(const char * __restri
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
-        const float * __restrict__ scale_weight, const int64_t scale_weight_ne,
-        const float * __restrict__ scale_activation, const int64_t scale_activation_ne,
-        const int scale_channel) {
+        const uint32_t scale_channel) {
     // Much simpler than mmq_process_tile because the repacked block
     // contains the tensor scale with the weights, so  the vecdot directly consumes
     // from src0 directly from GMEM. This lets us skip smem B staging and do 1 vecdot per kblock.
@@ -3570,26 +3565,20 @@ static __device__ __forceinline__ void process_nvfp4_tiles(const char * __restri
     constexpr int blocks_per_tile = QK_K / QK_NVFP4; // 4;
 
     const block_nvfp4_mmq * __restrict__ y_nv = reinterpret_cast<const block_nvfp4_mmq *>(y);
-    float input_scale = 1.0f;
-    if (scale_weight) {   // preserves the derived tensor style scaling for both single and experts individually
-        const int scale_idx = scale_weight_ne <= 1 ? 0 : scale_channel;
-        const float s = scale_weight[scale_idx];
-        input_scale *= s != 0.0f && isfinite(s) ? s : 1.0f;
-    }
-    if (scale_activation) { //
-        const int scale_idx = scale_activation_ne <= 1 ? 0 : scale_channel;
-        const float s = scale_activation[scale_idx];
-        input_scale *= s != 0.0f && isfinite(s) ? s : 1.0f;
-    }
+    const block_nvfp4_blackwell_tensor * __restrict__ x_tensor = (const block_nvfp4_blackwell_tensor *) x;
+    const float tensor_scale =
+        (x_tensor->weight_scales ? x_tensor->weight_scales[scale_channel] : x_tensor->weight_scale) *
+        (x_tensor->input_scales  ? x_tensor->input_scales[scale_channel]  : x_tensor->input_scale);
 
     const int k_block_start = kb0_start / 4;
     const int k_block_stop  = (kb0_stop + blocks_per_tile - 1) / blocks_per_tile;
 
     float sum[mmq_x*mmq_y / (nwarps*warp_size)] = {0.0f};
+    const block_nvfp4_blackwell * __restrict__ x_blocks = x_tensor->tiles + offset_x;
     for (int k_block = k_block_start; k_block < k_block_stop; ++k_block) {
         vec_dot_nvfp4_nvfp4_mma<mmq_x, mmq_y, need_check>(
-            x, offset_x + k_block, stride_row_x, y_nv + ncols_y * k_block,
-            sum, 0, tile_x_max_i, input_scale);
+            x_blocks + k_block, stride_row_x, y_nv + ncols_y * k_block,
+            sum, 0, tile_x_max_i, tensor_scale);
     }
 
     constexpr mmq_write_back_t write_back = mmq_write_back_mma<GGML_TYPE_NVFP4, mmq_x, mmq_y, need_check>;
@@ -3703,8 +3692,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx, const float * __restrict__ scale_weight, const int64_t scale_weight_ne,
-        const float * __restrict__ scale_activation, const int64_t scale_activation_ne) {
+        const uint3 ntx) {
 
     // Skip unused template specializations for faster compilation:
     if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
@@ -3795,8 +3783,7 @@ static __global__ void mul_mat_q(
             const int scale_channel = ids_dst ? zt : channel_x;
             process_nvfp4_tiles<mmq_x, mmq_y, need_check, fixup>
                 (x, offset_x_fp4, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y,
-                 stride_col_dst, tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, scale_weight, scale_weight_ne,
-                 scale_activation, scale_activation_ne, scale_channel);
+                 stride_col_dst, tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, scale_channel);
         } else
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
@@ -3887,8 +3874,7 @@ static __global__ void mul_mat_q(
             const int scale_channel = ids_dst ? zt : channel_x;
             process_nvfp4_tiles<mmq_x, mmq_y, need_check, fixup>
                 (x, offset_x_fp4, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y,
-                 stride_col_dst, tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, scale_weight, scale_weight_ne,
-                 scale_activation, scale_activation_ne, scale_channel);
+                 stride_col_dst, tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, scale_channel);
         } else
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
@@ -3968,8 +3954,7 @@ static __global__ void mul_mat_q(
         const int scale_channel = ids_dst ? zt : channel_x;
         process_nvfp4_tiles<mmq_x, mmq_y, need_check, fixup>
             (x, offset_x_fp4, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y,
-             stride_col_dst, tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, scale_weight, scale_weight_ne,
-             scale_activation, scale_activation_ne, scale_channel);
+             stride_col_dst, tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, scale_channel);
     } else
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
@@ -4122,8 +4107,6 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     bool use_stream_k; int64_t ncols_max;
-    const float * scale_weight = nullptr; int64_t scale_weight_ne = 0;
-    const float * scale_activation = nullptr; int64_t scale_activation_ne = 0;
 };
 
 template<ggml_type type>
@@ -4183,7 +4166,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 ntx_fd, args.scale_weight, args.scale_weight_ne, args.scale_activation, args.scale_activation_ne);
+                 ntx_fd);
         } else {
             constexpr bool need_check = true;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
@@ -4191,7 +4174,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 ntx_fd, args.scale_weight, args.scale_weight_ne, args.scale_activation, args.scale_activation_ne);
+                 ntx_fd);
         }
         return;
     }
@@ -4223,7 +4206,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, args.scale_weight, args.scale_weight_ne, args.scale_activation, args.scale_activation_ne);
+             ntx_fd);
 
         if (!fixup_needed) {
             return;
@@ -4241,7 +4224,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, args.scale_weight, args.scale_weight_ne, args.scale_activation, args.scale_activation_ne);
+             ntx_fd);
 
         if (!fixup_needed) {
             return;
@@ -4263,7 +4246,14 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const int nwarps    = mmq_get_nwarps_host(cc, warp_size);
 
-    const int mmq_x_max = get_mmq_x_max_host(cc);
+    int mmq_x_max = get_mmq_x_max_host(cc);
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    if constexpr (type == GGML_TYPE_NVFP4) {
+        if (args.ids_dst != nullptr && mmq_x_max > 64) {
+            mmq_x_max = 64;
+        }
+    }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
     const int mmq_y = get_mmq_y_host(cc);
 
     int mmq_x_best  = 0;

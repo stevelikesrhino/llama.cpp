@@ -17,7 +17,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
         case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
 #if defined(BLACKWELL_MMA_AVAILABLE)
-        case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1_bw;
+        case GGML_TYPE_NVFP4:   return nullptr; // changed to 5arg not matching vec_dot_q_cuda_t for now;
 #else
         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
@@ -518,11 +518,23 @@ static __global__ void mul_mat_vec_q(
                     kbx_q = int(((uint32_t) (row & 15) << 28) | ((uint32_t) (kbx & 3) << 24) | block_rel);
                 }
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
-
-                tmp[j][i] += vec_dot_q_cuda(vx, y_ptr, kbx_q, kqs_base);
+                {
+                tmp[j][i] += 
+#if defined(BLACKWELL_MMA_AVAILABLE) //todo: mod vec_dot_q_cuda_t with optional 5arg.
+                vec_dot_nvfp4_q8_1_bw(vx, y_ptr, kbx_q, kqs_base, channel_x);
+#else
+                vec_dot_q_cuda(vx, y_ptr, kbx_q, kqs_base);
+#endif //defined(BLACKWELL_MMA_AVILABLE)
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(vgate, y_ptr, kbx_q, kqs_base);
+                        tmp_gate[j][i] += 
+#if defined(BLACKWELL_MMA_AVAILABLE)
+                vec_dot_nvfp4_q8_1_bw(vx, y_ptr, kbx_q, kqs_base, channel_x);
+#else
+                vec_dot_q_cuda(vx, y_ptr, kbx_q, kqs_base);
+#endif //defined(BLACKWELL_MMA_AVILABLE)
+                        
+                        }
                     }
                 }
             }
@@ -668,7 +680,8 @@ static __global__ void mul_mat_vec_q_moe(
                 const int row = row0 + i;
                 const uint32_t block_rel = channel_x*stride_channel_x + (row / 16)*stride_row_x + (kbx >> 2);
                 kbx_q = int(((uint32_t) (row & 15) << 28) | ((uint32_t) (kbx & 3) << 24) | block_rel);
-            }
+                tmp[i] += vec_dot_nvfp4_q8_1_bw(vx, &y[kby], kbx_q, kqs, channel_x);
+            } else
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
             tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_q, kqs);
         }
@@ -743,7 +756,8 @@ static void mul_mat_vec_q_moe_launch(
     const dim3 block_dims(warp_size, ncols_dst);
 
     mul_mat_vec_q_moe<type, rows_per_block><<<block_nums, block_dims, 0, stream>>>(
-        vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
+        vx, vy, ids, dst,
+        ncols_x, nchannels_y, nrows_x,
         stride_row_x, stride_col_y, stride_col_dst,
         stride_channel_x, stride_channel_y, stride_channel_dst,
         ncols_dst, ids_stride);
@@ -1075,6 +1089,9 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     cudaStream_t stream = ctx.stream();
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const bool use_nvfp4 = src0->type == GGML_TYPE_NVFP4;
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
 
     const size_t ts_src0 = ggml_type_size(src0->type);
     const size_t ts_src1 = ggml_type_size(src1->type);
@@ -1116,7 +1133,7 @@ void ggml_cuda_mul_mat_vec_q(
         fusion_local.glu_op = fusion->glu_op;
     }
     // If src0 is a temporary compute buffer, clear any potential padding.
-    if (!(src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) &&
+    if (src0->type != GGML_TYPE_NVFP4 &&
             ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         const size_t size_data  = ggml_nbytes(src0);
         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
@@ -1205,8 +1222,7 @@ void ggml_cuda_op_mul_mat_vec_q(
 
     const int cc = ggml_cuda_info().devices[id].cc;
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    if (src0->type == GGML_TYPE_NVFP4 &&
-            blackwell_mma_available(cc)) {
+    if (src0->type == GGML_TYPE_NVFP4) {
         stride_row_x = ggml_cuda_nvfp4_blocks_per_row(ne00);
     }
 #endif // defined(BLACKWELL_MMA_AVAILABLE)

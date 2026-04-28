@@ -417,7 +417,7 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         {
             size_t copy_size = ggml_nbytes(src0);
 #if defined(BLACKWELL_MMA_AVAILABLE) // This is for proper copying of NVFP4 blocks with tensor scales
-            if (src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(ggml_cuda_info().devices[ctx.device].cc)) {
+            if (src0->type == GGML_TYPE_NVFP4) {
                 copy_size = ggml_cuda_nvfp4_tensor_alloc_size(src0);
                 GGML_ASSERT(copy_size == ggml_cuda_nvfp4_tensor_alloc_size(src1));
             }

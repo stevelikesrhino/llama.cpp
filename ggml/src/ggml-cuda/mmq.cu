@@ -96,9 +96,6 @@ void ggml_cuda_mul_mat_q(
 
     const char  * src0_d = (const char  *) src0->data;
     const float * src1_d = (const float *) src1->data;
-    const ggml_tensor * scale_w_t = src0->type == GGML_TYPE_NVFP4 ? ggml_cuda_mul_mat_weight_scale(dst) : nullptr;
-    const float * scale_w_d = scale_w_t ? (const float *) scale_w_t->data : nullptr;
-    const int64_t scale_w_ne = scale_w_t ? ggml_nelements(scale_w_t) : 0;
     const ggml_tensor * scale_x_t = src0->type == GGML_TYPE_NVFP4 ? ggml_cuda_mul_mat_input_scale(dst) : nullptr;
     const float * scale_x_d = scale_x_t ? (const float *) scale_x_t->data : nullptr;
     const int64_t scale_x_ne = scale_x_t ? ggml_nelements(scale_x_t) : 0;
@@ -106,24 +103,20 @@ void ggml_cuda_mul_mat_q(
     const ggml_tensor * scale_x_src = src0->type == GGML_TYPE_NVFP4 ? src0->src[1] : nullptr;
     float scale_x_header = 0.0f;
     memcpy(&scale_x_header, &src0->op_params[1], sizeof(scale_x_header));
-    const bool scale_x_in_header = src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc) &&
+    const bool scale_x_in_header = src0->type == GGML_TYPE_NVFP4 &&
         ((scale_x_src != nullptr && ggml_is_scalar(scale_x_src)) || scale_x_header > 0.0f);
     const float * scale_x_q_d = scale_x_d != nullptr ? scale_x_d :
         scale_x_in_header ? &((const block_nvfp4_blackwell_tensor *) src0_d)->input_scale : nullptr;
     const int64_t scale_x_q_ne = scale_x_d != nullptr ? scale_x_ne :
         scale_x_in_header ? 1 : 0;
-    const float * scale_x_mul_d = scale_x_in_header ? nullptr : scale_x_d;
-    const int64_t scale_x_mul_ne = scale_x_in_header ? 0 : scale_x_ne;
 #else
     const float * scale_x_q_d = scale_x_d;
     const int64_t scale_x_q_ne = scale_x_ne;
-    const float * scale_x_mul_d = scale_x_d;
-    const int64_t scale_x_mul_ne = scale_x_ne;
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
     float       *  dst_d = (float       *)  dst->data;
 
     // If src0 is a temporary compute buffer, clear any potential padding.
-    if (!(src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc)) &&
+    if (src0->type != GGML_TYPE_NVFP4 &&
             ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         const size_t size_data  = ggml_nbytes(src0);
         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
@@ -146,7 +139,7 @@ void ggml_cuda_mul_mat_q(
     int64_t s02_mmq = s02;
     int64_t s03_mmq = s03;
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    const bool use_nvfp4_layout = blackwell_mma_available(cc) && src0->type == GGML_TYPE_NVFP4;
+    const bool use_nvfp4_layout = src0->type == GGML_TYPE_NVFP4;
     if (use_nvfp4_layout) {
         s01_mmq = ggml_cuda_nvfp4_blocks_per_row(ne00);
         s02_mmq = ggml_cuda_bw_div_up(ne01, 16) * s01_mmq;
@@ -159,7 +152,7 @@ void ggml_cuda_mul_mat_q(
     // TODO: tighter pool buffer size vs q8 path
     const bool use_native_mxfp4 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP4;
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    const bool use_native_nvfp4 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_NVFP4;
+    const bool use_native_nvfp4 = src0->type == GGML_TYPE_NVFP4;
 #else
     const bool use_native_nvfp4 = false;
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
@@ -206,7 +199,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01_mmq, ne11, s1,
             ne02, ne12, s02_mmq, s12, s2,
             ne03, ne13, s03_mmq, s13, s3,
-            use_stream_k, ne1, scale_w_d, scale_w_ne, scale_x_mul_d, scale_x_mul_ne};
+            use_stream_k, ne1};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -278,7 +271,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01_mmq, ne_get_rows, s1,
         ne02, ne02, s02_mmq, s12, s2,
         ne03, ne13, s03_mmq, s13, s3,
-        use_stream_k, ne12, scale_w_d, scale_w_ne, scale_x_mul_d, scale_x_mul_ne};
+        use_stream_k, ne12};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
@@ -302,28 +295,13 @@ void ggml_cuda_op_mul_mat_q(
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    const bool use_nvfp4_layout = blackwell_mma_available(cc) && src0->type == GGML_TYPE_NVFP4;
+    const bool use_nvfp4_layout = src0->type == GGML_TYPE_NVFP4;
 #else
     const bool use_nvfp4_layout = false;
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
-    const ggml_tensor * scale_w_t = src0->type == GGML_TYPE_NVFP4 ? ggml_cuda_mul_mat_weight_scale(dst) : nullptr;
-    const float * scale_w_d = scale_w_t ? (const float *) scale_w_t->data : nullptr;
-    const int64_t scale_w_ne = scale_w_t ? ggml_nelements(scale_w_t) : 0;
-    const ggml_tensor * scale_x_t = src0->type == GGML_TYPE_NVFP4 ? ggml_cuda_mul_mat_input_scale(dst) : nullptr;
-    const float * scale_x_d = scale_x_t ? (const float *) scale_x_t->data : nullptr;
-    const int64_t scale_x_ne = scale_x_t ? ggml_nelements(scale_x_t) : 0;
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    const ggml_tensor * scale_x_src = src0->type == GGML_TYPE_NVFP4 ? src0->src[1] : nullptr;
-    float scale_x_header = 0.0f;
-    memcpy(&scale_x_header, &src0->op_params[1], sizeof(scale_x_header));
-    const bool scale_x_in_header = src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc) &&
-        ((scale_x_src != nullptr && ggml_is_scalar(scale_x_src)) || scale_x_header > 0.0f);
-    const float * scale_x_mul_d = scale_x_in_header ? nullptr : scale_x_d;
-    const int64_t scale_x_mul_ne = scale_x_in_header ? 0 : scale_x_ne;
     const int64_t stride01 = use_nvfp4_layout ? ggml_cuda_nvfp4_blocks_per_row(ne00) : ne00 / ggml_blck_size(src0->type);
 #else
-    const float * scale_x_mul_d = scale_x_d;
-    const int64_t scale_x_mul_ne = scale_x_ne;
     const int64_t stride01 = ne00 / ggml_blck_size(src0->type);
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
     // the main device has a larger memory buffer to hold the results from all GPUs
@@ -341,7 +319,7 @@ void ggml_cuda_op_mul_mat_q(
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
-        use_stream_k, src1_ncols, scale_w_d, scale_w_ne, scale_x_mul_d, scale_x_mul_ne};
+        use_stream_k, src1_ncols};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 

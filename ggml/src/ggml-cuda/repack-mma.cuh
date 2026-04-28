@@ -20,15 +20,16 @@ struct  __align__(16) block_nvfp4_blackwell {
 };
 
 struct  __align__(16) block_nvfp4_blackwell_tensor {
-    float   weight_scale;
-    float   input_scale;
-    uint8_t pad[8];
+    float         weight_scale;
+    float         input_scale;
+    const float * weight_scales; // For MOE per expert
+    const float * input_scales;
     block_nvfp4_blackwell tiles[];
 };
 
 static_assert(sizeof(block_nvfp4_blackwell_frag) == 640, "unexpected nvfp4 blackwell fragment size");
 static_assert(sizeof(block_nvfp4_blackwell) == 4 * sizeof(block_nvfp4_blackwell_frag), "unexpected nvfp4 blackwell size");
-static_assert(sizeof(block_nvfp4_blackwell_tensor) == 16, "unexpected nvfp4 blackwell tensor header size");
+static_assert(sizeof(block_nvfp4_blackwell_tensor) == 32, "unexpected nvfp4 blackwell tensor header size");
 static_assert(alignof(block_nvfp4_blackwell_frag) == 16, "nvfp4 blackwell fragment must be 16B aligned");
 static_assert(alignof(block_nvfp4_blackwell) == 16, "nvfp4 blackwell must be 16B aligned");
 static_assert(alignof(block_nvfp4_blackwell_tensor) == 16, "nvfp4 blackwell tensor must be 16B aligned");
@@ -86,12 +87,7 @@ static inline void ggml_cuda_nvfp4_set_tensor_header(const ggml_tensor * tensor,
     float input_scale  = 1.0f;
     const ggml_tensor * weight_scale_t = tensor->src[0];
     const ggml_tensor * input_scale_t  = tensor->src[1];
-    if (weight_scale_t != nullptr && ggml_is_scalar(weight_scale_t) && weight_scale_t->type == GGML_TYPE_F32 &&
-            weight_scale_t->data != nullptr && (weight_scale_t->buffer == nullptr || ggml_backend_buffer_is_host(weight_scale_t->buffer))) {
-        memcpy(&weight_scale, weight_scale_t->data, sizeof(weight_scale));
-    } else {
-        memcpy(&weight_scale, &tensor->op_params[0], sizeof(weight_scale)); // CUDA-owned NVFP4 cached by llama-model
-    }
+    memcpy(&weight_scale, &tensor->op_params[0], sizeof(weight_scale)); // CUDA-owned NVFP4 cached by llama-model
     if (input_scale_t != nullptr && ggml_is_scalar(input_scale_t) && input_scale_t->type == GGML_TYPE_F32 &&
             input_scale_t->data != nullptr && (input_scale_t->buffer == nullptr || ggml_backend_buffer_is_host(input_scale_t->buffer))) {
         memcpy(&input_scale, input_scale_t->data, sizeof(input_scale));
@@ -101,7 +97,12 @@ static inline void ggml_cuda_nvfp4_set_tensor_header(const ggml_tensor * tensor,
 
     dst->weight_scale = weight_scale > 0.0f ? weight_scale : 1.0f;
     dst->input_scale  = input_scale  > 0.0f ? input_scale  : 1.0f;
-    memset(dst->pad, 0, sizeof(dst->pad));
+    dst->weight_scales = weight_scale_t != nullptr && !ggml_is_scalar(weight_scale_t) &&
+        weight_scale_t->data != nullptr && weight_scale_t->buffer != nullptr &&
+        !ggml_backend_buffer_is_host(weight_scale_t->buffer) ? (const float *) weight_scale_t->data : nullptr;
+    dst->input_scales = input_scale_t != nullptr && !ggml_is_scalar(input_scale_t) &&
+        input_scale_t->data != nullptr && input_scale_t->buffer != nullptr &&
+        !ggml_backend_buffer_is_host(input_scale_t->buffer) ? (const float *) input_scale_t->data : nullptr;
 }
 
 static inline void ggml_cuda_repack_tiles_nvfp4(int64_t ne0, int64_t nrows, const void * src, void * dst) {

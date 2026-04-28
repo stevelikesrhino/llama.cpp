@@ -1509,7 +1509,7 @@ static inline const ggml_tensor * ggml_cuda_mul_mat_weight_scale(const ggml_tens
     }
     if (scale != nullptr && ggml_is_scalar(scale)) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
-        if (src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        if (src0->type == GGML_TYPE_NVFP4) {
             return nullptr;
         }
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
@@ -1536,7 +1536,7 @@ static inline const ggml_tensor * ggml_cuda_mul_mat_input_scale(const ggml_tenso
     }
     if (scale != nullptr && ggml_is_scalar(scale)) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
-        if (src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        if (src0->type == GGML_TYPE_NVFP4) {
             return nullptr;
         }
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
