@@ -518,22 +518,24 @@ static __global__ void mul_mat_vec_q(
                     kbx_q = int(((uint32_t) (row & 15) << 28) | ((uint32_t) (kbx & 3) << 24) | block_rel);
                 }
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
-                {
-                tmp[j][i] += 
 #if defined(BLACKWELL_MMA_AVAILABLE) //todo: mod vec_dot_q_cuda_t with optional 5arg.
-                vec_dot_nvfp4_q8_1_bw(vx, y_ptr, kbx_q, kqs_base, channel_x);
-#else
-                vec_dot_q_cuda(vx, y_ptr, kbx_q, kqs_base);
-#endif //defined(BLACKWELL_MMA_AVILABLE)
+                if constexpr (type == GGML_TYPE_NVFP4) {
+                    tmp[j][i] += vec_dot_nvfp4_q8_1_bw(vx, y_ptr, kbx_q, kqs_base, channel_x);
+                } else
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+                {
+                    tmp[j][i] += vec_dot_q_cuda(vx, y_ptr, kbx_q, kqs_base);
+                }
+
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += 
 #if defined(BLACKWELL_MMA_AVAILABLE)
-                vec_dot_nvfp4_q8_1_bw(vx, y_ptr, kbx_q, kqs_base, channel_x);
-#else
-                vec_dot_q_cuda(vx, y_ptr, kbx_q, kqs_base);
-#endif //defined(BLACKWELL_MMA_AVILABLE)
-                        
+                        if constexpr (type == GGML_TYPE_NVFP4) {
+                            tmp_gate[j][i] += vec_dot_nvfp4_q8_1_bw(vgate, y_ptr, kbx_q, kqs_base, channel_x);
+                        } else
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+                        {
+                            tmp_gate[j][i] += vec_dot_q_cuda(vgate, y_ptr, kbx_q, kqs_base);
                         }
                     }
                 }
