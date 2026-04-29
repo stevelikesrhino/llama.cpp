@@ -468,6 +468,11 @@ void llama_context::sched_reserve() {
 
     if (cparams.auto_fgdn) {
         LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", __func__);
+        auto is_gdn_device_mismatch = [this](ggml_backend_dev_t device_gdn, ggml_backend_dev_t device_kv) {
+            return device_gdn != device_kv && (!cparams.op_offload ||
+                    ggml_backend_dev_type(device_kv) != GGML_BACKEND_DEVICE_TYPE_CPU ||
+                    ggml_backend_dev_type(device_gdn) == GGML_BACKEND_DEVICE_TYPE_CPU);
+        };
 
         if (cparams.fused_gdn_ar) {
             auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
@@ -487,7 +492,7 @@ void llama_context::sched_reserve() {
                 GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FGDN_AR "-", prefix_len) == 0);
                 const int il = std::stoi(n->name + prefix_len);
                 ggml_backend_dev_t device_kv = model.dev_layer(il);
-                if (device_gdn != device_kv) {
+                if (is_gdn_device_mismatch(device_gdn, device_kv)) {
                     LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the fused Gated Delta Net tensor "
                             "is assigned to device %s (usually due to missing support)\n",
                             __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_gdn));
@@ -528,7 +533,7 @@ void llama_context::sched_reserve() {
                 GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FGDN_CH "-", prefix_len) == 0);
                 const int il = std::stoi(n->name + prefix_len);
                 ggml_backend_dev_t device_kv = model.dev_layer(il);
-                if (device_gdn != device_kv) {
+                if (is_gdn_device_mismatch(device_gdn, device_kv)) {
                     LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the fused Gated Delta Net tensor "
                             "is assigned to device %s (usually due to missing support)\n",
                             __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_gdn));

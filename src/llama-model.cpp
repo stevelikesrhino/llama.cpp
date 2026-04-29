@@ -7918,6 +7918,48 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    auto is_cuda_dev = [](ggml_backend_dev_t dev) {
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        return reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+    };
+
+    auto attach_nvfp4_scales = [](ggml_tensor * weight, ggml_tensor *& weight_scale, ggml_tensor * input_scale, bool use_cuda_nvfp4_scales) {
+        if (weight == nullptr || weight->type != GGML_TYPE_NVFP4) {
+            return;
+        }
+
+        GGML_ASSERT(weight_scale != nullptr && "NVFP4 weight scale is missing."); // weight scale required; input scale optional
+        weight->src[0] = weight_scale; // matmul reads attached scales before CUDA hides graph *_s
+        weight->src[1] = input_scale;
+        if (use_cuda_nvfp4_scales) {
+            weight_scale = nullptr; // CUDA applies attached scales inside matmul, so graph skips late ggml_mul
+        }
+    };
+
+    for (int il = 0; il < n_layer; ++il) {
+        auto & layer = layers[il];
+        const bool use_cuda_nvfp4_scales = is_cuda_dev(pimpl->dev_layer[il].dev);
+        attach_nvfp4_scales(layer.wq,              layer.wq_s,              layer.wq_in_s,              use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.wk,              layer.wk_s,              layer.wk_in_s,              use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.wv,              layer.wv_s,              layer.wv_in_s,              use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.wo,              layer.wo_s,              layer.wo_in_s,              use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.wqkv,            layer.wqkv_s,            layer.wqkv_in_s,            use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.wqkv_gate,       layer.wqkv_gate_s,       layer.wqkv_gate_in_s,       use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.ffn_gate,        layer.ffn_gate_s,        layer.ffn_gate_in_s,        use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.ffn_down,        layer.ffn_down_s,        layer.ffn_down_in_s,        use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.ffn_up,          layer.ffn_up_s,          layer.ffn_up_in_s,          use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.ffn_gate_exps,   layer.ffn_gate_exps_s,   layer.ffn_gate_exps_in_s,   use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.ffn_down_exps,   layer.ffn_down_exps_s,   layer.ffn_down_exps_in_s,   use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.ffn_up_exps,     layer.ffn_up_exps_s,     layer.ffn_up_exps_in_s,     use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.ffn_gate_shexp,  layer.ffn_gate_shexp_s,  layer.ffn_gate_shexp_in_s,  use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.ffn_down_shexp,  layer.ffn_down_shexp_s,  layer.ffn_down_shexp_in_s,  use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.ffn_up_shexp,    layer.ffn_up_shexp_s,    layer.ffn_up_shexp_in_s,    use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.ssm_in,          layer.ssm_in_s,          layer.ssm_in_in_s,          use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.ssm_out,         layer.ssm_out_s,         layer.ssm_out_in_s,         use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.ssm_alpha,       layer.ssm_alpha_s,       layer.ssm_alpha_in_s,       use_cuda_nvfp4_scales);
+        attach_nvfp4_scales(layer.ssm_beta,        layer.ssm_beta_s,        layer.ssm_beta_in_s,        use_cuda_nvfp4_scales);
+    }
+
     ml.done_getting_tensors();
 
     // populate tensors_by_name
@@ -7929,6 +7971,60 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
+
+    auto get_mapped_scalar_f32 = [&ml](ggml_tensor * tensor, float & value) {
+        if (tensor == nullptr || !ggml_is_scalar(tensor) || tensor->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        const auto * weight = ml.get_weight(ggml_get_name(tensor));
+        if (weight == nullptr || weight->idx >= ml.mappings.size()) {
+            return false;
+        }
+
+        const auto & mapping = ml.mappings.at(weight->idx);
+        memcpy(&value, (const uint8_t *) mapping->addr() + weight->offs, sizeof(value));
+        return true;
+    };
+
+    auto cache_nvfp4_scales = [&get_mapped_scalar_f32](ggml_tensor * weight) {
+        if (weight == nullptr || weight->type != GGML_TYPE_NVFP4) {
+            return;
+        }
+
+        float weight_scale = 1.0f;
+        if (get_mapped_scalar_f32(weight->src[0], weight_scale)) {
+            memcpy(&weight->op_params[0], &weight_scale, sizeof(weight_scale));
+        }
+
+        float input_scale = 1.0f;
+        if (get_mapped_scalar_f32(weight->src[1], input_scale)) {
+            memcpy(&weight->op_params[1], &input_scale, sizeof(input_scale));
+        }
+    };
+
+    for (int il = 0; il < n_layer; ++il) {
+        auto & layer = layers[il];
+        cache_nvfp4_scales(layer.wq);
+        cache_nvfp4_scales(layer.wk);
+        cache_nvfp4_scales(layer.wv);
+        cache_nvfp4_scales(layer.wo);
+        cache_nvfp4_scales(layer.wqkv);
+        cache_nvfp4_scales(layer.wqkv_gate);
+        cache_nvfp4_scales(layer.ffn_gate);
+        cache_nvfp4_scales(layer.ffn_down);
+        cache_nvfp4_scales(layer.ffn_up);
+        cache_nvfp4_scales(layer.ffn_gate_exps);
+        cache_nvfp4_scales(layer.ffn_down_exps);
+        cache_nvfp4_scales(layer.ffn_up_exps);
+        cache_nvfp4_scales(layer.ffn_gate_shexp);
+        cache_nvfp4_scales(layer.ffn_down_shexp);
+        cache_nvfp4_scales(layer.ffn_up_shexp);
+        cache_nvfp4_scales(layer.ssm_in);
+        cache_nvfp4_scales(layer.ssm_out);
+        cache_nvfp4_scales(layer.ssm_alpha);
+        cache_nvfp4_scales(layer.ssm_beta);
+    }
 
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
