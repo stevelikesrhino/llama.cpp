@@ -333,7 +333,7 @@ static __device__ __forceinline__ uint32_t nvfp4_pack4_i8_packed8(const uint32_t
         ((uint32_t)(uint8_t) kvalues_mxfp4[(packed8 >> (4*(off4 + 3))) & 0x0F] << 24);
 }
 
-#define VDR_NVFP4_Q8_1_MMVQ 4
+#define VDR_NVFP4_Q8_1_MMVQ 2
 #define VDR_NVFP4_Q8_1_MMQ  8
 #define VDR_NVFP4_NVFP4_MMQ 4
 
