@@ -1055,7 +1055,7 @@ static __device__ __forceinline__ void load_nvfp4_tileA(
         tx[1] = (int) packed.y;
         tx[2] = (int) packed.z;
         tx[3] = (int) packed.w;
-        scale = frag.scales_u32[lane];
+        scale = frag.scales_u32[((lane >> 2) * 2) + (lane & 1)];
         return;
     }
 

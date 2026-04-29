@@ -12,7 +12,7 @@
 
 struct  __align__(16) block_nvfp4_blackwell_frag {
     uint32_t regs[32][4];
-    uint32_t scales_u32[32];
+    uint32_t scales_u32[16];
 };
 
 struct  __align__(16) block_nvfp4_blackwell {
@@ -27,7 +27,7 @@ struct  __align__(16) block_nvfp4_blackwell_tensor {
     block_nvfp4_blackwell tiles[];
 };
 
-static_assert(sizeof(block_nvfp4_blackwell_frag) == 640, "unexpected nvfp4 blackwell fragment size");
+static_assert(sizeof(block_nvfp4_blackwell_frag) == 576, "unexpected nvfp4 blackwell fragment size");
 static_assert(sizeof(block_nvfp4_blackwell) == 4 * sizeof(block_nvfp4_blackwell_frag), "unexpected nvfp4 blackwell size");
 static_assert(sizeof(block_nvfp4_blackwell_tensor) == 32, "unexpected nvfp4 blackwell tensor header size");
 static_assert(alignof(block_nvfp4_blackwell_frag) == 16, "nvfp4 blackwell fragment must be 16B aligned");
@@ -43,8 +43,8 @@ static inline GGML_HD uint32_t ggml_cuda_nvfp4_tile_q_word(
 
 static inline GGML_HD uint32_t ggml_cuda_nvfp4_tile_scale_word(
     const block_nvfp4_blackwell & tile, int row_in_tile, int frag_idx) {
-        const int lane = ((row_in_tile & 7) * 4) + (row_in_tile >> 3);
-        return tile.tiles[frag_idx].scales_u32[lane];
+        const int scale_lane = ((row_in_tile & 7) * 2) + (row_in_tile >> 3);
+        return tile.tiles[frag_idx].scales_u32[scale_lane];
 }
 
 static inline GGML_HD int64_t ggml_cuda_bw_div_up(int64_t n, int64_t d) {
@@ -134,7 +134,7 @@ static inline void ggml_cuda_repack_tiles_nvfp4(int64_t ne0, int64_t nrows, cons
                 const block_nvfp4 * src_row = (const block_nvfp4 *) (src_bytes + row * src_row_size);
                 const int lane_base = (row_in_tile & 7) * 4;
                 const int row_half = row_in_tile >> 3;
-                const int scale_lane = lane_base + row_half;
+                const int scale_lane = ((row_in_tile & 7) * 2) + row_half;
 
                 for (int frag = 0; frag < frags_in_block; ++frag) {
                     const block_nvfp4 & in = src_row[src_block0 + frag];
@@ -155,8 +155,7 @@ static inline void ggml_cuda_repack_tiles_nvfp4(int64_t ne0, int64_t nrows, cons
 
                     uint32_t d = 0;
                     memcpy(&d, in.d, sizeof(d));
-                    tile.scales_u32[scale_lane + 0] = d;
-                    tile.scales_u32[scale_lane + 2] = d;
+                    tile.scales_u32[scale_lane] = d;
                 }
             }
         }
@@ -196,7 +195,7 @@ static inline void ggml_cuda_unpack_tiles_nvfp4(int64_t ne0, int64_t nrows, cons
         const int row_in_tile = (int) (row % 16);
         const int lane_base = (row_in_tile & 7) * 4;
         const int row_half = row_in_tile >> 3;
-        const int scale_lane = lane_base + row_half;
+        const int scale_lane = ((row_in_tile & 7) * 2) + row_half;
 
         for (int64_t block_col = 0; block_col < src_blocks_per_row; ++block_col) {
             const int64_t dst_block0 = block_col * 4;

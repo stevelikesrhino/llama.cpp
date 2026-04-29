@@ -390,7 +390,7 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1_bw(
     const block_nvfp4_blackwell_frag & frag_tile = tile.tiles[frag];
     const int lane_base = (row_in_tile & 7) * 4;
     const int reg_base  = row_in_tile >> 3;
-    const uint32_t scale_word = frag_tile.scales_u32[lane_base + reg_base];
+    const uint32_t scale_word = frag_tile.scales_u32[((row_in_tile & 7) * 2) + reg_base];
     const float tensor_scale = tensor->weight_scales ? tensor->weight_scales[channel_x] : tensor->weight_scale;
 
     float sum = 0.0f;
