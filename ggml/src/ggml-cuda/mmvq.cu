@@ -70,7 +70,8 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GCN,
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
-    MMVQ_PARAMETERS_RDNA4
+    MMVQ_PARAMETERS_RDNA4,
+    MMVQ_PARAMETERS_BLACKWELL
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -82,6 +83,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_RDNA2;
 #elif defined(GCN) || defined(CDNA)
     return MMVQ_PARAMETERS_GCN;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
+    return MMVQ_PARAMETERS_BLACKWELL;
 #else
     return MMVQ_PARAMETERS_GENERIC;
 #endif
@@ -100,6 +103,10 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
         return MMVQ_PARAMETERS_GCN;
     }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN) {
+        return MMVQ_PARAMETERS_BLACKWELL;
+    }
+
     return MMVQ_PARAMETERS_GENERIC;
 }
 
@@ -303,7 +310,10 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_BLACKWELL) {
+        if (table_id == MMVQ_PARAMETERS_BLACKWELL && type == GGML_TYPE_NVFP4 && ncols_dst == 1) {
+            return 2;
+        }
         switch (ncols_dst) {
             case 1:
             case 2:
@@ -381,7 +391,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_BLACKWELL) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
@@ -630,6 +640,73 @@ static __global__ void mul_mat_vec_q(
     }
 }
 
+#if defined(BLACKWELL_MMA_AVAILABLE)
+template <int rows_per_cuda_block>
+__launch_bounds__(2*rows_per_cuda_block*ggml_cuda_get_physical_warp_size(), 2)
+static __global__ void mul_mat_vec_nvfp4_bw_tg1(
+        const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t stride_row_x,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint3 channel_ratio, const uint3 sample_ratio,
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+
+    constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    constexpr int warps_per_row   = 2;
+    constexpr int qi_per_vdr      = QI_NVFP4 / VDR_NVFP4_Q8_1_MMVQ;
+    constexpr int blocks_per_iter = VDR_NVFP4_Q8_1_MMVQ * warps_per_row * warp_size / QI_NVFP4;
+    constexpr int blocks_per_k    = QK_NVFP4 / QK8_1;
+
+    const int lane        = threadIdx.x;
+    const int row_i       = threadIdx.y >> 1;
+    const int warp_in_row = threadIdx.y & 1;
+    const int tid_row     = warp_in_row*warp_size + lane;
+    const int row         = rows_per_cuda_block*blockIdx.x + row_i;
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t channel_x   = fastdiv(channel_dst, channel_ratio);
+    const uint32_t channel_y   = channel_dst;
+    const uint32_t sample_dst  = blockIdx.z;
+    const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+    const uint32_t sample_y    = sample_dst;
+
+    const int blocks_per_row_x = ncols_x / QK_NVFP4;
+    const int kbx_begin        = tid_row / qi_per_vdr;
+    const int kqs              = VDR_NVFP4_Q8_1_MMVQ * (tid_row % qi_per_vdr);
+
+    const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+
+    float tmp = 0.0f;
+    if (uint32_t(row) < nrows_x) {
+        const uint32_t block_rel_base = sample_x*stride_sample_x + channel_x*stride_channel_x + (row / 16)*stride_row_x;
+        for (int kbx = kbx_begin; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * blocks_per_k;
+            const int kbx_q = int(((uint32_t) (row & 15) << 28) | ((uint32_t) (kbx & 3) << 24) |
+                    (block_rel_base + (kbx >> 2)));
+            tmp += vec_dot_nvfp4_q8_1_bw(vx, &y[kby], kbx_q, kqs, channel_x);
+        }
+    }
+
+    __shared__ float tmp_shared[rows_per_cuda_block][warp_size];
+    if (warp_in_row == 1) {
+        tmp_shared[row_i][lane] = tmp;
+    }
+    __syncthreads();
+
+    if (warp_in_row != 0) {
+        return;
+    }
+
+    tmp += tmp_shared[row_i][lane];
+    tmp = warp_reduce_sum<warp_size>(tmp);
+
+    if (lane == 0 && uint32_t(row) < nrows_x) {
+        dst[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row] = tmp;
+    }
+}
+
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+
+
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
@@ -850,6 +927,22 @@ static void mul_mat_vec_q_switch_ncols_dst(
     switch (ncols_dst) {
         case 1: {
             constexpr int c_ncols_dst = 1;
+#if defined(BLACKWELL_MMA_AVAILABLE)
+            if constexpr (type == GGML_TYPE_NVFP4) {
+                if (table_id == MMVQ_PARAMETERS_BLACKWELL && !has_ids && !has_fusion) {
+                    constexpr int rows_per_cuda_block = 4;
+                    const int64_t nblocks_rows = (nrows_x + rows_per_cuda_block - 1) / rows_per_cuda_block;
+                    const dim3 block_nums(nblocks_rows, nchannels_dst, nsamples_dst);
+                    const dim3 block_dims(warp_size, 2*rows_per_cuda_block, 1);
+                    mul_mat_vec_nvfp4_bw_tg1<rows_per_cuda_block><<<block_nums, block_dims, 0, stream>>>(
+                        vx, vy, dst, ncols_x, nrows_x, stride_row_x,
+                        stride_channel_x, stride_channel_y, stride_channel_dst,
+                        channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst);
+                    return;
+                }
+            }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+
 
             bool use_small_k = should_use_small_k(c_ncols_dst);
 

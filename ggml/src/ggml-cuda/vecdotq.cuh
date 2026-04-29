@@ -368,11 +368,12 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
 }
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
-static __device__ __forceinline__ int get_int_from_table_16_contiguous4(const uint32_t q4, const int8_t * table) {
-    const uint32_t * table32 = (const uint32_t *) table;
-    const uint32_t low  = __byte_perm(table32[0], table32[1], q4);
-    const uint32_t high = __byte_perm(table32[2], table32[3], q4);
-    return __byte_perm(low, high, 0x3210u | ((q4 & 0x8888u) >> 1));
+static __device__ __forceinline__ int get_int_from_table_16_contiguous4(const uint32_t q4, const int8_t *) {
+    constexpr uint32_t table0 = 0x03020100u;
+    constexpr uint32_t table1 = 0x0C080604u;
+    const uint32_t mag   = __byte_perm(table0, table1, q4);
+    const uint32_t signs = __byte_perm(0x00000000u, 0xFFFFFFFFu, 0x3210u | ((q4 & 0x8888u) >> 1));
+    return __vsub4(mag ^ signs, signs);
 }
 
 static __device__ __forceinline__ float vec_dot_nvfp4_q8_1_bw(
