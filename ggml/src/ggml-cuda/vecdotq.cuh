@@ -381,7 +381,8 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1_bw(
                                         const block_q8_1 * __restrict__ bq8_1,
                                         const int32_t & kbx,
                                         const int32_t & iqs,
-                                        const uint32_t channel_x) {
+                                        const uint32_t channel_x,
+                                        const bool apply_input_scale) {
     const uint32_t packed_kbx = (uint32_t) kbx;
     const int row_in_tile = packed_kbx >> 28;
     const int frag = (packed_kbx >> 24) & 0x0F;
@@ -392,7 +393,8 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1_bw(
     const int lane_base = (row_in_tile & 7) * 4;
     const int reg_base  = row_in_tile >> 3;
     const uint32_t scale_word = frag_tile.scales_u32[((row_in_tile & 7) * 2) + reg_base];
-    const float tensor_scale = tensor->weight_scales ? tensor->weight_scales[channel_x] : tensor->weight_scale;
+    const float tensor_scale = (tensor->weight_scales ? tensor->weight_scales[channel_x] : tensor->weight_scale) *
+        (apply_input_scale ? tensor->input_scale : 1.0f);
 
     float sum = 0.0f;
 #pragma unroll

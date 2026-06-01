@@ -1,9 +1,10 @@
 #include "quantize.cuh"
 #include <cstdint>
 
+template <bool has_scale>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
-        const float * __restrict__ x, void * __restrict__ vy,
+        const float * __restrict__ x, void * __restrict__ vy, const float * __restrict__ scale_activation,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
     ggml_cuda_pdl_lc();
@@ -29,8 +30,17 @@ static __global__ void quantize_q8_1(
     const int64_t ib  = i_cont / QK8_1; // block index
     const int64_t iqs = i_cont % QK8_1; // quant index
 
+    float inv_input_scale = 1.0f;
+    if constexpr (has_scale) {
+        float input_scale = scale_activation[0];
+        if (!(input_scale != 0.0f) || !isfinite(input_scale)) {
+            input_scale = 1.0f;
+        }
+        inv_input_scale = 1.0f / input_scale;
+    }
+
     ggml_cuda_pdl_sync();
-    const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
+    const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] * inv_input_scale : 0.0f;
     float amax = fabsf(xi);
     float sum = xi;
 
@@ -394,8 +404,17 @@ void quantize_row_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    quantize_row_q8_1_cuda(x, ids, vy, type_src0, ne00, s01, s02, s03, ne0, ne1, ne2, ne3, nullptr, 0, stream);
+}
+
+void quantize_row_q8_1_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const float * scale_activation, const int64_t scale_activation_ne, cudaStream_t stream) {
     GGML_ASSERT(!ids);
     GGML_ASSERT(ne0 % QK8_1 == 0);
+    GGML_ASSERT(scale_activation == nullptr || scale_activation_ne <= 1);
 
     const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
 
@@ -403,7 +422,11 @@ void quantize_row_q8_1_cuda(
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    if (scale_activation != nullptr) {
+        ggml_cuda_kernel_launch(quantize_q8_1<true>, launch_params, x, vy, scale_activation, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    } else {
+        ggml_cuda_kernel_launch(quantize_q8_1<false>, launch_params, x, vy, nullptr, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    }
     GGML_UNUSED(type_src0);
 }
 

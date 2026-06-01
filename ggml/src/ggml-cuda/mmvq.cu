@@ -620,7 +620,7 @@ static __global__ void mul_mat_vec_q(
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 #if defined(BLACKWELL_MMA_AVAILABLE) //todo: mod vec_dot_q_cuda_t with optional 5arg.
                 if constexpr (type == GGML_TYPE_NVFP4) {
-                    tmp[j][i] += vec_dot_nvfp4_q8_1_bw(vx, y_ptr, kbx_q, kqs_base, channel_x);
+                    tmp[j][i] += vec_dot_nvfp4_q8_1_bw(vx, y_ptr, kbx_q, kqs_base, channel_x, fusion.scale_activation != nullptr);
                 } else
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
                 {
@@ -631,7 +631,7 @@ static __global__ void mul_mat_vec_q(
                     if (use_gate) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
                         if constexpr (type == GGML_TYPE_NVFP4) {
-                            tmp_gate[j][i] += vec_dot_nvfp4_q8_1_bw(vgate, y_ptr, kbx_q, kqs_base, channel_x);
+                            tmp_gate[j][i] += vec_dot_nvfp4_q8_1_bw(vgate, y_ptr, kbx_q, kqs_base, channel_x, fusion.scale_activation != nullptr);
                         } else
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
                         {
@@ -738,7 +738,8 @@ static __global__ void mul_mat_vec_nvfp4_bw_tg1(
         const uint32_t ncols_x, const uint32_t nrows_x, const uint32_t stride_row_x,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint3 channel_ratio, const uint3 sample_ratio,
-        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst) {
+        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+        const bool apply_input_scale) {
 
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int warps_per_row   = 2;
@@ -772,7 +773,7 @@ static __global__ void mul_mat_vec_nvfp4_bw_tg1(
             const int kby = kbx * blocks_per_k;
             const int kbx_q = int(((uint32_t) (row & 15) << 28) | ((uint32_t) (kbx & 3) << 24) |
                     (block_rel_base + (kbx >> 2)));
-            tmp += vec_dot_nvfp4_q8_1_bw(vx, &y[kby], kbx_q, kqs, channel_x);
+            tmp += vec_dot_nvfp4_q8_1_bw(vx, &y[kby], kbx_q, kqs, channel_x, apply_input_scale);
         }
     }
 
@@ -809,7 +810,7 @@ static __global__ void mul_mat_vec_q_moe(
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
-        const uint32_t ncols_dst, const uint32_t ids_stride) {
+        const uint32_t ncols_dst, const uint32_t ids_stride, const bool apply_input_scale) {
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -817,6 +818,13 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    if constexpr (type != GGML_TYPE_NVFP4) {
+        GGML_UNUSED(apply_input_scale);
+    }
+#else
+    GGML_UNUSED(apply_input_scale);
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
 
     const uint32_t token_idx   = threadIdx.y;
     const int      row0        = c_rows_per_block*blockIdx.x;
@@ -849,7 +857,7 @@ static __global__ void mul_mat_vec_q_moe(
                 const int row = row0 + i;
                 const uint32_t block_rel = channel_x*stride_channel_x + (row / 16)*stride_row_x + (kbx >> 2);
                 kbx_q = int(((uint32_t) (row & 15) << 28) | ((uint32_t) (kbx & 3) << 24) | block_rel);
-                tmp[i] += vec_dot_nvfp4_q8_1_bw(vx, &y[kby], kbx_q, kqs, channel_x);
+                tmp[i] += vec_dot_nvfp4_q8_1_bw(vx, &y[kby], kbx_q, kqs, channel_x, apply_input_scale);
             } else
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
             tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_q, kqs);
@@ -919,7 +927,7 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride,
-        const int warp_size, const int nchannels_dst, cudaStream_t stream) {
+        const bool apply_input_scale, const int warp_size, const int nchannels_dst, cudaStream_t stream) {
 
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
@@ -931,7 +939,7 @@ static void mul_mat_vec_q_moe_launch(
         ncols_x, nchannels_y, nrows_x,
         stride_row_x, stride_col_y, stride_col_dst,
         stride_channel_x, stride_channel_y, stride_channel_dst,
-        ncols_dst, ids_stride);
+        ncols_dst, ids_stride, apply_input_scale);
 }
 
 template <ggml_type type>
@@ -1012,7 +1020,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             vx, vy, ids, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
+            ncols_dst, ids_stride, fusion.scale_activation != nullptr, warp_size, nchannels_dst, stream);
         return;
     }
 
@@ -1029,7 +1037,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     mul_mat_vec_nvfp4_bw_tg1<rows_per_cuda_block><<<block_nums, block_dims, 0, stream>>>(
                         vx, vy, dst, ncols_x, nrows_x, stride_row_x,
                         stride_channel_x, stride_channel_y, stride_channel_dst,
-                        channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst);
+                        channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
+                        fusion.scale_activation != nullptr);
                     return;
                 }
             }
@@ -1367,6 +1376,37 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t s13_src1 = src1->nb[3] / ts_src1;
     const void * src0_data = src0->data;
 
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const auto get_scalar_nvfp4_input_scale = [](const ggml_tensor * tensor, float & scale) {
+        if (tensor == nullptr || tensor->type != GGML_TYPE_NVFP4) {
+            return false;
+        }
+
+        const ggml_tensor * scale_t = tensor->src[1];
+        if (scale_t != nullptr && !ggml_is_scalar(scale_t)) {
+            return false;
+        }
+        memcpy(&scale, &tensor->op_params[1], sizeof(scale));
+        if (!(scale > 0.0f) && scale_t != nullptr && ggml_is_scalar(scale_t) && scale_t->type == GGML_TYPE_F32 &&
+                scale_t->data != nullptr && (scale_t->buffer == nullptr || ggml_backend_buffer_is_host(scale_t->buffer))) {
+            memcpy(&scale, scale_t->data, sizeof(scale));
+        }
+
+        return ((scale_t != nullptr && ggml_is_scalar(scale_t)) || scale > 0.0f) && scale > 0.0f;
+    };
+
+    float input_scale = 1.0f;
+    bool apply_input_scale = use_nvfp4 && get_scalar_nvfp4_input_scale(src0, input_scale);
+    if (apply_input_scale && fusion != nullptr && fusion->gate != nullptr) {
+        float gate_input_scale = 1.0f;
+        apply_input_scale = get_scalar_nvfp4_input_scale(fusion->gate, gate_input_scale) && gate_input_scale == input_scale;
+    }
+    if (apply_input_scale) {
+        fusion_local.scale_activation = &((const block_nvfp4_blackwell_tensor *) src0_data)->input_scale;
+        fusion_local.scale_activation_ne = 1;
+    }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+
     const size_t nbytes_src1 = size_t(ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
     ggml_cuda_pool_alloc<char> src1_t(ctx.pool(), nbytes_src1);
 
@@ -1374,8 +1414,13 @@ void ggml_cuda_mul_mat_vec_q(
     int64_t stride_channel_y = ids ? ne10_padded / QK8_1 : ne11 * (ne10_padded / QK8_1);
     int64_t stride_sample_y = ne12 * ne11 * (ne10_padded / QK8_1);
 
-    quantize_row_q8_1_cuda(src1_d, nullptr, src1_t.get(), src0->type, ne10, s11_src1, s12_src1, s13_src1,
-            ne10_padded, ne11, ne12, ne13, stream);
+    if (fusion_local.scale_activation != nullptr) {
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_t.get(), src0->type, ne10, s11_src1, s12_src1, s13_src1,
+                ne10_padded, ne11, ne12, ne13, fusion_local.scale_activation, fusion_local.scale_activation_ne, stream);
+    } else {
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_t.get(), src0->type, ne10, s11_src1, s12_src1, s13_src1,
+                ne10_padded, ne11, ne12, ne13, stream);
+    }
 
     mul_mat_vec_q_switch_type(
         src0_data, src0->type, src1_t.get(), ids_d, fusion_local, dst_d, ne00,
