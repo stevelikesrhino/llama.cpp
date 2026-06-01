@@ -58,6 +58,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Ernie4_5_ForCausalLM": "ernie",
     "Ernie4_5_MoeForCausalLM": "ernie",
     "EuroBertModel": "bert",
+    "Exaone4_5_ForConditionalGeneration": "exaone",
     "Exaone4ForCausalLM": "exaone",
     "ExaoneForCausalLM": "exaone",
     "ExaoneMoEForCausalLM": "exaone",
@@ -237,8 +238,10 @@ TEXT_MODEL_MAP: dict[str, str] = {
 MMPROJ_MODEL_MAP: dict[str, str] = {
     "AudioFlamingo3ForConditionalGeneration": "ultravox",
     "CogVLMForCausalLM": "cogvlm",
+    "DeepseekOCR2ForCausalLM": "deepseek",
     "DeepseekOCRForCausalLM": "deepseek",
     "DotsOCRForCausalLM": "dotsocr",
+    "Exaone4_5_ForConditionalGeneration": "exaone",
     "Gemma3ForConditionalGeneration": "gemma",
     "Gemma3nForConditionalGeneration": "gemma",
     "Gemma4ForConditionalGeneration": "gemma",
