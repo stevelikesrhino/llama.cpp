@@ -259,9 +259,9 @@ struct server_slot {
         return task->need_embd() || (spec && common_speculative_need_embd(spec));
     }
 
-    bool need_embd_pre_norm() const {
+    bool need_embd_nextn() const {
         GGML_ASSERT(task);
-        return spec && common_speculative_need_embd_pre_norm(spec);
+        return spec && common_speculative_need_embd_nextn(spec);
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
@@ -2782,8 +2782,11 @@ private:
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
+                            // ref: https://github.com/ggml-org/llama.cpp/pull/24110
+                            const bool has_new_tokens = (n_past < slot.task->n_tokens());
+
                             // the largest pos_min required for a checkpoint to be useful
-                            const auto pos_min_thold = std::max(0, pos_next - n_swa - 1);
+                            const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -3013,7 +3016,7 @@ private:
 
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
-                        // streaming hook can mirror t_h_pre_norm into ctx_dft.
+                        // streaming hook can mirror t_h_nextn into ctx_dft.
                         common_batch_add(batch,
                             cur_tok,
                             slot.prompt.tokens.pos_next(),
