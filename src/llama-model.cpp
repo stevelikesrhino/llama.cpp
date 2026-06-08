@@ -1482,7 +1482,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     };
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = 0; il < n_layer_all; ++il) {
         auto & layer = layers[il];
         const bool use_cuda_nvfp4_scales = is_cuda_dev(pimpl->dev_layer[il].dev);
         attach_nvfp4_scales(layer.wq,              layer.wq_s,              layer.wq_in_s,              use_cuda_nvfp4_scales);
@@ -1552,7 +1552,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     };
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = 0; il < n_layer_all; ++il) {
         auto & layer = layers[il];
         cache_nvfp4_scales(layer.wq);
         cache_nvfp4_scales(layer.wk);
