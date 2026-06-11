@@ -152,7 +152,7 @@ static int get_mmq_y_host(const int cc) {
 
 static constexpr __device__ int get_iter_k([[maybe_unused]] const ggml_type type) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
-    return type == GGML_TYPE_MXFP4 ? MMQ_ITER_K_FP4 : MMQ_ITER_K;
+    return (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) ? MMQ_ITER_K_FP4 : MMQ_ITER_K;
 
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
     return MMQ_ITER_K;
@@ -4358,6 +4358,14 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+
+bool ggml_cuda_should_use_nvfp4_tc_mmvq(enum ggml_type type, int cc, int64_t ncols_dst);
+
+void ggml_cuda_mul_mat_nvfp4_tc_mmvq(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+
+void ggml_cuda_mul_mat_nvfp4_glu_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,

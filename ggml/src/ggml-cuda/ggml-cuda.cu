@@ -2760,6 +2760,50 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+static bool ggml_cuda_should_fuse_glu_nvfp4_mmq(const ggml_tensor * glu, const ggml_tensor * mul_mat) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    if (glu->op != GGML_OP_GLU || mul_mat->op != GGML_OP_MUL_MAT || mul_mat->src[1] != glu) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = mul_mat->src[0];
+    if (src0->type != GGML_TYPE_NVFP4 || glu->type != GGML_TYPE_F32 || mul_mat->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    if (src0->ne[0] != glu->ne[0] || glu->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+
+    if (!ggml_cuda_can_quantize_nvfp4_glu(glu)) {
+        return false;
+    }
+
+    if (src0->buffer == nullptr || glu->buffer == nullptr) {
+        return false;
+    }
+
+    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) || ggml_backend_buft_is_cuda_split(glu->buffer->buft);
+    if (split) {
+        return false;
+    }
+
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                   ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                   src0->view_src;
+    if (bad_padding_clear) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return blackwell_mma_available(cc) && ggml_cuda_should_use_mmq(src0->type, cc, glu->ne[1], /*n_experts=*/0);
+#else
+    GGML_UNUSED(glu);
+    GGML_UNUSED(mul_mat);
+    return false;
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -2808,6 +2852,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    if (src0->type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc)) {
+        return false;
+    }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+
     const ggml_tensor * w_s    = ggml_cuda_mul_mat_weight_scale(tensor);
     const ggml_tensor * w_in_s = ggml_cuda_mul_mat_input_scale(tensor);
     if (tensor->op == GGML_OP_MUL_MAT_ID && src0->type == GGML_TYPE_NVFP4) {
@@ -2827,7 +2878,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
     // fusion is not universally faster on Pascal
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
@@ -2910,6 +2960,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     //TODO update for generic tensor parallelism
     const int cc                 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool use_nvfp4_tc_mmvq = !split && !bad_padding_clear && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+                                   ggml_cuda_should_use_nvfp4_tc_mmvq(src0->type, cc, src1->ne[1]);
     bool use_batched_cublas_f16  = src0->type == GGML_TYPE_F16 && (src1->type == GGML_TYPE_F16 || !any_gpus_with_slow_fp16);
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
@@ -2925,6 +2977,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_f) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+    } else if (use_nvfp4_tc_mmvq) {
+        ggml_cuda_mul_mat_nvfp4_tc_mmvq(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_vec_q) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_q) {
@@ -2966,6 +3020,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+        if (ggml_cuda_should_use_nvfp4_tc_mmvq(src0->type, cc, ne2)) {
+            ggml_cuda_mul_mat_nvfp4_tc_mmvq(ctx, src0, src1, ids, dst);
+            return;
+        }
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
@@ -4329,6 +4387,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (types_ok && shape_ok && dim_ok && x_in_add == x) {
             ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
             return 4;
+        }
+    }
+
+    // GLU + NVFP4 ffn_down MMQ: compute SWIGLU directly in the activation quantizer.
+    if (i + 1 < cgraph->n_nodes) {
+        const ggml_op ops[] = { GGML_OP_GLU, GGML_OP_MUL_MAT };
+        int out_nodes[] = { i + 1 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 2, ops, out_nodes, 1)) {
+            ggml_tensor * glu     = cgraph->nodes[i];
+            ggml_tensor * mul_mat = cgraph->nodes[i + 1];
+
+            if (ggml_cuda_should_fuse_glu_nvfp4_mmq(glu, mul_mat) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+                ggml_cuda_mul_mat_nvfp4_glu_q(*cuda_ctx, mul_mat->src[0], glu, mul_mat);
+                return 1;
+            }
         }
     }
 

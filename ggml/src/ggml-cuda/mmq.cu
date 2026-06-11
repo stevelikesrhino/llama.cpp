@@ -74,11 +74,28 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
-void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_q_launch(
+        ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const bool force_mmq_x_8_nvfp4) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    if (force_mmq_x_8_nvfp4) {
+        GGML_ASSERT(args.type_x == GGML_TYPE_NVFP4);
+        launch_mul_mat_q<GGML_TYPE_NVFP4, 8>(ctx, args, stream);
+        return;
+    }
+#else
+    GGML_ASSERT(!force_mmq_x_8_nvfp4);
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+
+    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+}
+
+static void ggml_cuda_mul_mat_q_impl(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const bool force_mmq_x_8_nvfp4, const bool fuse_src1_glu_nvfp4) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+    GGML_ASSERT(!fuse_src1_glu_nvfp4 || (!ids && src0->type == GGML_TYPE_NVFP4 && ggml_cuda_can_quantize_nvfp4_glu(src1)));
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -172,8 +189,19 @@ void ggml_cuda_mul_mat_q(
                                          ne11, ne12, ne13, stream);
 #if defined(BLACKWELL_MMA_AVAILABLE)
             } else if (use_native_nvfp4) {
-                quantize_mmq_nvfp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
-                                        ne11, ne12, ne13, scale_x_q_d, scale_x_q_ne, stream);
+                if (fuse_src1_glu_nvfp4) {
+                    const ggml_tensor * gate = src1->src[0];
+                    const ggml_tensor * up   = src1->src[1];
+                    const size_t ts_gate = ggml_type_size(gate->type);
+                    const size_t ts_up   = ggml_type_size(up->type);
+                    quantize_mmq_nvfp4_glu_cuda((const float *) gate->data, (const float *) up->data, src1_q8_1.get(), src0->type, ne10,
+                                                gate->nb[1] / ts_gate, gate->nb[2] / ts_gate, gate->nb[3] / ts_gate,
+                                                up->nb[1]   / ts_up,   up->nb[2]   / ts_up,   up->nb[3]   / ts_up,
+                                                ne10_padded, ne11, ne12, ne13, scale_x_q_d, scale_x_q_ne, stream);
+                } else {
+                    quantize_mmq_nvfp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                                            ne11, ne12, ne13, scale_x_q_d, scale_x_q_ne, stream);
+                }
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
@@ -200,7 +228,7 @@ void ggml_cuda_mul_mat_q(
             ne02, ne12, s02_mmq, s12, s2,
             ne03, ne13, s03_mmq, s13, s3,
             use_stream_k, ne1};
-        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+        ggml_cuda_mul_mat_q_launch(ctx, args, stream, force_mmq_x_8_nvfp4);
         return;
     }
 
@@ -273,7 +301,38 @@ void ggml_cuda_mul_mat_q(
         ne03, ne13, s03_mmq, s13, s3,
         use_stream_k, ne12};
 
-    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+    ggml_cuda_mul_mat_q_launch(ctx, args, stream, force_mmq_x_8_nvfp4);
+}
+
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0, src1, ids, dst, false, false);
+}
+
+bool ggml_cuda_should_use_nvfp4_tc_mmvq(enum ggml_type type, int cc, int64_t ncols_dst) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    return type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc) && ncols_dst > 0 && ncols_dst <= 8;
+#else
+    GGML_UNUSED_VARS(type, cc, ncols_dst);
+    return false;
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+}
+
+void ggml_cuda_mul_mat_nvfp4_tc_mmvq(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int64_t ncols_dst = ids ? dst->ne[2] : src1->ne[1];
+    GGML_ASSERT(ggml_cuda_should_use_nvfp4_tc_mmvq(src0->type, cc, ncols_dst));
+    ggml_cuda_mul_mat_q_impl(ctx, src0, src1, ids, dst, true, false);
+}
+
+void ggml_cuda_mul_mat_nvfp4_glu_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    GGML_ASSERT(src0->type == GGML_TYPE_NVFP4);
+    GGML_ASSERT(blackwell_mma_available(cc));
+    GGML_ASSERT(ggml_cuda_can_quantize_nvfp4_glu(src1));
+    ggml_cuda_mul_mat_q_impl(ctx, src0, src1, nullptr, dst, false, true);
 }
 
 void ggml_cuda_op_mul_mat_q(
