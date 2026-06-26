@@ -85,32 +85,100 @@ __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
     return static_cast<uint8_t>(biased);
 }
 
-static __device__ __forceinline__ uint32_t ggml_cuda_fp32x8_to_fp4_e2m1(const float (&v)[8]) {
+static __device__ __forceinline__ float ggml_cuda_fp4x2_mse(
+        const uint32_t fp16x2, const float scale, const float x0, const float x1) {
+    const float q0 = __half2float(__ushort_as_half((uint16_t) (fp16x2 & 0xFFFFu))) * scale;
+    const float q1 = __half2float(__ushort_as_half((uint16_t) (fp16x2 >> 16))) * scale;
+    const float e0 = q0 - x0;
+    const float e1 = q1 - x1;
+    return e0 * e0 + e1 * e1;
+}
+
+static __device__ __forceinline__ uint32_t ggml_cuda_fp32x8_to_fp4_e2m1_mse(
+        const float (&x)[8], const float inv_scale, const float dequant_scale, float & err) {
+    float v[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        v[k] = x[k] * inv_scale;
+    }
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
     uint32_t packed;
+    uint32_t fp16x2_0;
+    uint32_t fp16x2_1;
+    uint32_t fp16x2_2;
+    uint32_t fp16x2_3;
     asm volatile(
         "{\n"
         ".reg .b8 byte0;\n"
         ".reg .b8 byte1;\n"
         ".reg .b8 byte2;\n"
         ".reg .b8 byte3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
-        "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+        "cvt.rn.satfinite.e2m1x2.f32   byte0, %6, %5;\n"
+        "cvt.rn.satfinite.e2m1x2.f32   byte1, %8, %7;\n"
+        "cvt.rn.satfinite.e2m1x2.f32   byte2, %10, %9;\n"
+        "cvt.rn.satfinite.e2m1x2.f32   byte3, %12, %11;\n"
         "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+        "cvt.rn.f16x2.e2m1x2 %1, byte0;\n"
+        "cvt.rn.f16x2.e2m1x2 %2, byte1;\n"
+        "cvt.rn.f16x2.e2m1x2 %3, byte2;\n"
+        "cvt.rn.f16x2.e2m1x2 %4, byte3;\n"
         "}"
-        : "=r"(packed)
+        : "=r"(packed), "=r"(fp16x2_0), "=r"(fp16x2_1), "=r"(fp16x2_2), "=r"(fp16x2_3)
         : "f"(v[0]), "f"(v[1]), "f"(v[2]), "f"(v[3]), "f"(v[4]), "f"(v[5]), "f"(v[6]), "f"(v[7]));
+    err += ggml_cuda_fp4x2_mse(fp16x2_0, dequant_scale, x[0], x[1]);
+    err += ggml_cuda_fp4x2_mse(fp16x2_1, dequant_scale, x[2], x[3]);
+    err += ggml_cuda_fp4x2_mse(fp16x2_2, dequant_scale, x[4], x[5]);
+    err += ggml_cuda_fp4x2_mse(fp16x2_3, dequant_scale, x[6], x[7]);
     return packed;
 #else
     uint32_t packed = 0;
 #pragma unroll
     for (int k = 0; k < 8; ++k) {
-        packed |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(v[k], 1.0f) << (4 * k);
+        const uint8_t q = ggml_cuda_float_to_fp4_e2m1(v[k], 1.0f);
+        const float dq = 0.5f * dequant_scale * (float) kvalues_mxfp4[q];
+        const float e = dq - x[k];
+        err += e * e;
+        packed |= (uint32_t) q << (4 * k);
     }
     return packed;
 #endif
+}
+
+static __device__ __forceinline__ float ggml_cuda_nvfp4_quantize_code_mse(
+        const float (&vals0)[8], const float (&vals1)[8], const uint8_t fp8_code,
+        uint32_t & qs0, uint32_t & qs1) {
+    const float subblock_scale = ggml_cuda_ue4m3_to_fp32(fp8_code);
+    const float inv_scale      = subblock_scale > 0.0f ? 0.5f / subblock_scale : 0.0f;
+    const float dequant_scale  = 2.0f * subblock_scale;
+
+    float err = 0.0f;
+    qs0 = ggml_cuda_fp32x8_to_fp4_e2m1_mse(vals0, inv_scale, dequant_scale, err);
+    qs1 = ggml_cuda_fp32x8_to_fp4_e2m1_mse(vals1, inv_scale, dequant_scale, err);
+    return err;
+}
+
+static __device__ __forceinline__ void ggml_cuda_nvfp4_quantize_4o6_mse(
+        const float (&vals0)[8], const float (&vals1)[8], const float sub_max,
+        uint32_t & qs0, uint32_t & qs1, uint8_t & fp8_code) {
+    constexpr float SCALE_EPS = 0.001953125f;
+
+    const float scale6_f = fmaxf(sub_max * (1.0f / 6.0f), SCALE_EPS);
+    const uint8_t fp8_code6 = ggml_cuda_fp32_to_ue4m3(scale6_f);
+    uint32_t qs6_0;
+    uint32_t qs6_1;
+    const float err6 = ggml_cuda_nvfp4_quantize_code_mse(vals0, vals1, fp8_code6, qs6_0, qs6_1);
+
+    const float scale4_f = fmaxf(sub_max * 0.25f, SCALE_EPS);
+    const uint8_t fp8_code4 = ggml_cuda_fp32_to_ue4m3(scale4_f);
+    uint32_t qs4_0;
+    uint32_t qs4_1;
+    const float err4 = ggml_cuda_nvfp4_quantize_code_mse(vals0, vals1, fp8_code4, qs4_0, qs4_1);
+
+    const bool use4 = err4 < err6;
+    qs0 = use4 ? qs4_0 : qs6_0;
+    qs1 = use4 ? qs4_1 : qs6_1;
+    fp8_code = use4 ? fp8_code4 : fp8_code6;
 }
 
 bool ggml_cuda_can_quantize_nvfp4_glu(const ggml_tensor * src) {
@@ -206,23 +274,12 @@ static __global__ void quantize_mmq_nvfp4(const float * __restrict__ x,
         sub_max = fmaxf(sub_max, fabsf(v));
     }
 
-    // RNE to FP8 E4M3 — matches ModelOpt / trtllm.fp4_quantize reference algorithm.
-    // SCALE_EPS = 2^-9 = FP8 E4M3 smallest subnormal; clamp prevents NaN propagation in
-    // degenerate blocks (sub_max ~ 0). See TensorRT-LLM arcquantFP4.cu:35, 352.
-    constexpr float SCALE_EPS = 0.001953125f;
-    const float scale_f = fmaxf(sub_max * (1.0f / 6.0f), SCALE_EPS);
-    const uint8_t fp8_code = ggml_cuda_fp32_to_ue4m3(scale_f);
-    const float subblock_scale = ggml_cuda_ue4m3_to_fp32(fp8_code);
-    const float inv_scale = subblock_scale > 0.0f ? 0.5f / subblock_scale : 0.0f;
-    float scaled_lo[8];
-    float scaled_hi[8];
-#pragma unroll
-    for (int k = 0; k < 8; ++k) {
-        scaled_lo[k] = vals0[k] * inv_scale;
-        scaled_hi[k] = vals1[k] * inv_scale;
-    }
-    yb->qs_u32[2 * sub + 0] = ggml_cuda_fp32x8_to_fp4_e2m1(scaled_lo);
-    yb->qs_u32[2 * sub + 1] = ggml_cuda_fp32x8_to_fp4_e2m1(scaled_hi);
+    uint32_t qs0;
+    uint32_t qs1;
+    uint8_t fp8_code;
+    ggml_cuda_nvfp4_quantize_4o6_mse(vals0, vals1, sub_max, qs0, qs1, fp8_code);
+    yb->qs_u32[2 * sub + 0] = qs0;
+    yb->qs_u32[2 * sub + 1] = qs1;
     reinterpret_cast<uint8_t *>(yb->sc4_u32)[sub] = fp8_code;
 #else
     NO_DEVICE_CODE; // This is for Blackwell NVFP4 activations only.
@@ -303,18 +360,12 @@ static __global__ void quantize_mmq_nvfp4_glu(const float * __restrict__ gate,
         sub_max = fmaxf(sub_max, fabsf(v));
     }
 
-    constexpr float SCALE_EPS = 0.001953125f;
-    const float scale_f = fmaxf(sub_max * (1.0f / 6.0f), SCALE_EPS);
-    const uint8_t fp8_code = ggml_cuda_fp32_to_ue4m3(scale_f);
-    const float subblock_scale = ggml_cuda_ue4m3_to_fp32(fp8_code);
-    const float inv_scale = subblock_scale > 0.0f ? 0.5f / subblock_scale : 0.0f;
-#pragma unroll
-    for (int k = 0; k < 8; ++k) {
-        vals0[k] *= inv_scale;
-        vals1[k] *= inv_scale;
-    }
-    yb->qs_u32[2 * sub + 0] = ggml_cuda_fp32x8_to_fp4_e2m1(vals0);
-    yb->qs_u32[2 * sub + 1] = ggml_cuda_fp32x8_to_fp4_e2m1(vals1);
+    uint32_t qs0;
+    uint32_t qs1;
+    uint8_t fp8_code;
+    ggml_cuda_nvfp4_quantize_4o6_mse(vals0, vals1, sub_max, qs0, qs1, fp8_code);
+    yb->qs_u32[2 * sub + 0] = qs0;
+    yb->qs_u32[2 * sub + 1] = qs1;
     reinterpret_cast<uint8_t *>(yb->sc4_u32)[sub] = fp8_code;
 #else
     NO_DEVICE_CODE;
