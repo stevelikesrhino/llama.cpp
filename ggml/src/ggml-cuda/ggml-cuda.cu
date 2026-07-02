@@ -3567,9 +3567,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         return false;
     }
 
-    if (copy_from_host) {
-        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
-    } else if (src->type == GGML_TYPE_NVFP4) {
+    if (src->type == GGML_TYPE_NVFP4) {
         size_t copy_size = ggml_nbytes(src);
 #if defined(BLACKWELL_MMA_AVAILABLE)
         copy_size = ggml_cuda_nvfp4_tensor_alloc_size(src);
