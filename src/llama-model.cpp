@@ -1387,7 +1387,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!layer.ffn_down_exps_s && layer.ffn_down_exps) {
                 layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
-            if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
+            if (!layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
+                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+            } else if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
                 layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
 
@@ -1445,7 +1447,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!layer.ffn_down_exps_in_s && layer.ffn_down_exps) {
                 layer.ffn_down_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
-            if (!layer.ffn_up_exps_in_s && layer.ffn_up_exps) {
+            if (!layer.ffn_up_exps_in_s && layer.ffn_gate_up_exps) {
+                layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+            } else if (!layer.ffn_up_exps_in_s && layer.ffn_up_exps) {
                 layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_gate_shexp_in_s && layer.ffn_gate_shexp) {
@@ -1521,7 +1525,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         attach_nvfp4_scales(layer.ffn_up,          layer.ffn_up_s,          layer.ffn_up_in_s,          use_cuda_nvfp4_scales);
         attach_nvfp4_scales(layer.ffn_gate_exps,   layer.ffn_gate_exps_s,   layer.ffn_gate_exps_in_s,   use_cuda_nvfp4_scales);
         attach_nvfp4_scales(layer.ffn_down_exps,   layer.ffn_down_exps_s,   layer.ffn_down_exps_in_s,   use_cuda_nvfp4_scales);
-        attach_nvfp4_scales(layer.ffn_up_exps,     layer.ffn_up_exps_s,     layer.ffn_up_exps_in_s,     use_cuda_nvfp4_scales);
+        ggml_tensor * ffn_up_exps = layer.ffn_gate_up_exps ? layer.ffn_gate_up_exps : layer.ffn_up_exps;
+        attach_nvfp4_scales(ffn_up_exps,           layer.ffn_up_exps_s,     layer.ffn_up_exps_in_s,     use_cuda_nvfp4_scales);
         attach_nvfp4_scales(layer.ffn_gate_shexp,  layer.ffn_gate_shexp_s,  layer.ffn_gate_shexp_in_s,  use_cuda_nvfp4_scales);
         attach_nvfp4_scales(layer.ffn_down_shexp,  layer.ffn_down_shexp_s,  layer.ffn_down_shexp_in_s,  use_cuda_nvfp4_scales);
         attach_nvfp4_scales(layer.ffn_up_shexp,    layer.ffn_up_shexp_s,    layer.ffn_up_shexp_in_s,    use_cuda_nvfp4_scales);
@@ -1594,6 +1599,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         cache_nvfp4_scales(layer.ffn_gate_exps);
         cache_nvfp4_scales(layer.ffn_down_exps);
         cache_nvfp4_scales(layer.ffn_up_exps);
+        cache_nvfp4_scales(layer.ffn_gate_up_exps);
         cache_nvfp4_scales(layer.ffn_gate_shexp);
         cache_nvfp4_scales(layer.ffn_down_shexp);
         cache_nvfp4_scales(layer.ffn_up_shexp);
