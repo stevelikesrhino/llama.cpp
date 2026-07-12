@@ -1,3 +1,20 @@
+# About this fork
+
+This specialized branch extends llama.cpp's NVFP4 W4A4 CUDA implementation for NVIDIA SM120 (RTX 50 series, RTX Pro Blackwell, basically consumer ones). The repacked NVFP4 AoSoA/MMA layout was originally implemented by [Michael Wand](https://github.com/michaelw9999). I extended it with a native NVFP4 x NVFP4 low-batch path. Logically, this is MMVQ, but internally it reuses MMQ with an 8-column tile to match Blackwell's fixed-N tensor-core MMA instruction.
+
+Runtime activation quantization also uses adaptive 4/6 block scaling based on [Four Over Six](https://arxiv.org/abs/2512.02010).
+
+The native W4A4 path provides decoding performance comparable to generic NVFP4 x Q8_1 MMVQ, while prefill is generally faster than upstream llama.cpp. Its weight, input-scale, and activation-quantization behavior also more closely matches the W4A4 implementations in NVIDIA TensorRT-LLM and Model Optimizer. Models tested include the Nemotron series, Qwen3.5/Qwen3.6, and Gemma 4.
+
+> [!IMPORTANT]
+> This repository does not produce high-quality NVFP4 GGUF files directly from original BF16 checkpoints. Convert a properly quantized NVFP4 safetensors checkpoint to GGUF yourself, or obtain a suitable NVFP4 model from Hugging Face. Directly quantizing an original BF16 model to NVFP4 with this repository is not recommended.
+
+## Why
+
+Windows has few straightforward, high-performance inference engines for NVFP4 models. Running vLLM under WSL 2 is possible but it's still a pain (I went through it). This fork is a small contribution toward improving native Windows NVFP4 inference for SM120.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
