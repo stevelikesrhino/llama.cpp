@@ -74,6 +74,7 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
+// Native Blackwell NVFP4 MMVQ reuses MMQ with mmq_x=8 to match the fixed N=8 MMA tile.
 static void ggml_cuda_mul_mat_q_launch(
         ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const bool force_mmq_x_8_nvfp4) {
 #if defined(BLACKWELL_MMA_AVAILABLE)

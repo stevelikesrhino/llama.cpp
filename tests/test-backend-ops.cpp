@@ -4075,7 +4075,7 @@ struct test_mul_mat : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
+        // Blackwell native FP4 quantizes activations to FP4 instead of Q8_1, so use a higher tolerance.
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
@@ -4264,7 +4264,7 @@ struct test_mul_mat_id : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
+        // Blackwell native FP4 quantizes activations to FP4 instead of Q8_1, so use a higher tolerance.
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }

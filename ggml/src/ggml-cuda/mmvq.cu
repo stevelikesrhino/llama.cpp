@@ -5,6 +5,9 @@
 
 #include <cstdint>
 
+// Native Blackwell NVFP4 MMVQ uses the W4A4 tensor-core MMQ path in mmq.cu.
+// The NVFP4 implementation here is the DP4A fallback.
+
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
