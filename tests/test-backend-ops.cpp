@@ -4075,7 +4075,7 @@ struct test_mul_mat : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
+        // Blackwell native FP4 quantizes activations to FP4 instead of Q8_1, so use a higher tolerance.
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
@@ -4264,7 +4264,7 @@ struct test_mul_mat_id : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
+        // Blackwell native FP4 quantizes activations to FP4 instead of Q8_1, so use a higher tolerance.
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
@@ -4308,6 +4308,306 @@ struct test_mul_mat_id : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats);
     }
+};
+
+struct test_mul_mat_nvfp4_scales : public test_case {
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const float weight_scale = 1.5f;
+    const float input_scale  = 0.75f;
+
+    test_mul_mat_nvfp4_scales(int64_t m, int64_t n, int64_t k) : m(m), n(n), k(k) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(m, n, k, weight_scale, input_scale);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_NVFP4_SCALES";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_NVFP4, k, m);
+        ggml_set_name(weight, "test.weight");
+
+        ggml_tensor * weight_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(weight_s, "test.weight.scale");
+        ggml_tensor * input_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(input_s, "test.weight.input_scale");
+
+        weight->src[0] = weight_s;
+        weight->src[1] = input_s;
+        memcpy(&weight->op_params[0], &weight_scale, sizeof(weight_scale));
+        memcpy(&weight->op_params[1], &input_scale,  sizeof(input_scale));
+
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(input, "input");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, weight, input);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "test.weight.scale") == 0) {
+                ggml_backend_tensor_set(t, &weight_scale, 0, sizeof(weight_scale));
+            } else if (strcmp(t->name, "test.weight.input_scale") == 0) {
+                ggml_backend_tensor_set(t, &input_scale, 0, sizeof(input_scale));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        std::vector<float> scaled_ref(n);
+        for (size_t i = 0; i < n; ++i) {
+            scaled_ref[i] = b[i] * weight_scale;
+        }
+        return nmse(a, scaled_ref.data(), n);
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        return backend_has_feature(backend, "BLACKWELL_NATIVE_FP4") ? 2e-2 : DBL_MAX;
+    }
+
+    bool run_whole_graph() override { return true; }
+};
+
+struct test_mul_mat_id_nvfp4_scales : public test_case {
+    const int n_mats;
+    const int n_used;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool gate_up;
+    const std::array<float, 4> weight_scales = { 0.5f, 1.0f, 1.5f, 2.0f };
+    const std::array<float, 4> input_scales  = { 0.75f, 1.25f, 0.625f, 1.5f };
+
+    test_mul_mat_id_nvfp4_scales(int n_mats, int n_used, int64_t m, int64_t n, int64_t k, bool gate_up)
+        : n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), gate_up(gate_up) {
+        GGML_ASSERT(n_mats == (int) weight_scales.size());
+        GGML_ASSERT(n_used <= n_mats);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_mats, n_used, m, n, k, gate_up);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return gate_up ? "MUL_MAT_ID_NVFP4_GATE_UP" : "MUL_MAT_ID_NVFP4_SCALES";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t rows = gate_up ? 2 * m : m;
+        const char * weight_name = gate_up ? "blk.0.ffn_gate_up_exps.weight" : "blk.0.ffn_up_exps.weight";
+        const char * scale_name = gate_up ? "blk.0.ffn_gate_up_exps.scale" : "blk.0.ffn_up_exps.scale";
+        const char * input_scale_name = gate_up ? "blk.0.ffn_gate_up_exps.input_scale" : "blk.0.ffn_up_exps.input_scale";
+
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_NVFP4, k, rows, n_mats);
+        ggml_set_name(weights, weight_name);
+        ggml_tensor * weight_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_mats);
+        ggml_set_name(weight_s, scale_name);
+        ggml_tensor * input_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_mats);
+        ggml_set_name(input_s, input_scale_name);
+        weights->src[0] = weight_s;
+        weights->src[1] = input_s;
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        ggml_set_name(ids, "view_of_ids");
+
+        ggml_tensor * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+        ggml_set_name(input, "input");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, weights, input, ids);
+        if (gate_up) {
+            ggml_tensor * gate = ggml_view_3d(ctx, out, m, n_used, n, out->nb[1], out->nb[2], 0);
+            ggml_tensor * up   = ggml_view_3d(ctx, out, m, n_used, n, out->nb[1], out->nb[2], m * out->nb[0]);
+            out = ggml_glu_split(ctx, gate, up, GGML_GLU_OP_REGLU);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strstr(t->name, ".input_scale") != nullptr) {
+                ggml_backend_tensor_set(t, input_scales.data(), 0, sizeof(input_scales));
+            } else if (strstr(t->name, ".scale") != nullptr) {
+                ggml_backend_tensor_set(t, weight_scales.data(), 0, sizeof(weight_scales));
+            } else if (strcmp(t->name, "ids") == 0) {
+                std::vector<int32_t> data(n_mats * n);
+                for (int64_t i2 = 0; i2 < n; ++i2) {
+                    for (int i1 = 0; i1 < n_mats; ++i1) {
+                        data[i2 * n_mats + i1] = (i1 + i2) % n_mats;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (!ggml_is_view_op(t->op)) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n_elements) override {
+        GGML_ASSERT(n_elements == (size_t) (m * n_used * n));
+        std::vector<float> scaled_ref(n_elements);
+        for (int64_t i2 = 0; i2 < n; ++i2) {
+            for (int i1 = 0; i1 < n_used; ++i1) {
+                const int expert = (i1 + i2) % n_mats;
+                float scale = weight_scales[expert];
+                if (gate_up) {
+                    scale *= scale;
+                }
+                for (int64_t i0 = 0; i0 < m; ++i0) {
+                    const size_t index = i0 + m * (i1 + n_used * i2);
+                    scaled_ref[index] = b[index] * scale;
+                }
+            }
+        }
+        return nmse(a, scaled_ref.data(), n_elements);
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        return backend_has_feature(backend, "BLACKWELL_NATIVE_FP4") ? 2e-2 : DBL_MAX;
+    }
+
+    bool run_whole_graph() override { return true; }
+};
+
+struct test_mul_mat_nvfp4_glu : public test_case {
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const float weight_scale = 1.5f;
+    const float input_scale  = 0.75f;
+
+    test_mul_mat_nvfp4_glu(int64_t m, int64_t n, int64_t k) : m(m), n(n), k(k) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(m, n, k, weight_scale, input_scale);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_NVFP4_GLU";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(up, "up");
+        ggml_tensor * glu = ggml_glu_split(ctx, gate, up, GGML_GLU_OP_SWIGLU);
+
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_NVFP4, k, m);
+        ggml_set_name(weight, "down.weight");
+        ggml_tensor * weight_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(weight_s, "down.weight.scale");
+        ggml_tensor * input_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(input_s, "down.weight.input_scale");
+        weight->src[0] = weight_s;
+        weight->src[1] = input_s;
+        memcpy(&weight->op_params[0], &weight_scale, sizeof(weight_scale));
+        memcpy(&weight->op_params[1], &input_scale,  sizeof(input_scale));
+
+        ggml_tensor * out = ggml_mul_mat(ctx, weight, glu);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "down.weight.scale") == 0) {
+                ggml_backend_tensor_set(t, &weight_scale, 0, sizeof(weight_scale));
+            } else if (strcmp(t->name, "down.weight.input_scale") == 0) {
+                ggml_backend_tensor_set(t, &input_scale, 0, sizeof(input_scale));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        std::vector<float> scaled_ref(n);
+        for (size_t i = 0; i < n; ++i) {
+            scaled_ref[i] = b[i] * weight_scale;
+        }
+        return nmse(a, scaled_ref.data(), n);
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        return backend_has_feature(backend, "BLACKWELL_NATIVE_FP4") ? 2e-2 : DBL_MAX;
+    }
+
+    bool run_whole_graph() override { return true; }
+};
+
+struct test_nvfp4_repack_buffer_ops : public test_case {
+    std::string vars() override {
+        return {};
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NVFP4_REPACK_BUFFER_OPS";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_NVFP4, 256, 16);
+        ggml_set_name(src, "copy_src");
+        ggml_tensor * copy_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_NVFP4, 128, 32);
+        ggml_set_name(copy_storage, "copy_storage");
+        ggml_tensor * copied = ggml_cpy(ctx, src, copy_storage);
+        ggml_set_name(copied, "copied");
+
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 128, 4);
+        ggml_set_name(input, "input");
+        ggml_tensor * out = ggml_mul_mat(ctx, copied, input);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            init_tensor_uniform(t);
+
+            if (strcmp(t->name, "copy_src") != 0) {
+                continue;
+            }
+
+            const size_t nbytes = ggml_nbytes(t);
+            std::vector<uint8_t> actual(nbytes);
+            ggml_backend_tensor_memset(t, 0x11, 0, nbytes);
+            ggml_backend_tensor_get(t, actual.data(), 0, nbytes);
+            GGML_ASSERT(std::all_of(actual.begin(), actual.end(), [](uint8_t value) { return value == 0x11; }));
+
+            init_tensor_uniform(t);
+            std::vector<uint8_t> expected(nbytes);
+            ggml_backend_tensor_get(t, expected.data(), 0, nbytes);
+            constexpr size_t offset = 7;
+            constexpr size_t size = 41;
+            memset(expected.data() + offset, 0x22, size);
+            ggml_backend_tensor_memset(t, 0x22, offset, size);
+            ggml_backend_tensor_get(t, actual.data(), 0, nbytes);
+            GGML_ASSERT(actual == expected);
+        }
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        return backend_has_feature(backend, "BLACKWELL_NATIVE_FP4") ? 2e-2 : 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
 };
 
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
@@ -8788,6 +9088,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
+    test_cases.emplace_back(new test_mul_mat_nvfp4_scales(64, 16, 256));
+    test_cases.emplace_back(new test_mul_mat_id_nvfp4_scales(4, 2, 64, 16, 256, false));
+    test_cases.emplace_back(new test_mul_mat_id_nvfp4_scales(4, 2, 64, 16, 256, true));
+    test_cases.emplace_back(new test_mul_mat_nvfp4_glu(64, 16, 256));
+    test_cases.emplace_back(new test_nvfp4_repack_buffer_ops());
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));

@@ -35,24 +35,28 @@ struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
     uint32_t n_tokens_per_seq;
+    bool allow_op_offload_cpu_layer;
 };
 
 static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
-    /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN,
-    /*.name             =*/ "Flash Attention",
-    /*.n_tokens_per_seq =*/ 1,
+    /*.op                         =*/ LLM_FUSED_OP_FLASH_ATTN,
+    /*.name                       =*/ "Flash Attention",
+    /*.n_tokens_per_seq           =*/ 1,
+    /*.allow_op_offload_cpu_layer =*/ false,
 };
 
 static const llm_fused_op_probe llm_fused_op_gdn_ar_probe = {
-    /*.op               =*/ LLM_FUSED_OP_GDN_AR,
-    /*.name             =*/ "fused Gated Delta Net (autoregressive)",
-    /*.n_tokens_per_seq =*/ 1,
+    /*.op                         =*/ LLM_FUSED_OP_GDN_AR,
+    /*.name                       =*/ "fused Gated Delta Net (autoregressive)",
+    /*.n_tokens_per_seq           =*/ 1,
+    /*.allow_op_offload_cpu_layer =*/ true,
 };
 
 static const llm_fused_op_probe llm_fused_op_gdn_ch_probe = {
-    /*.op               =*/ LLM_FUSED_OP_GDN_CH,
-    /*.name             =*/ "fused Gated Delta Net (chunked)",
-    /*.n_tokens_per_seq =*/ 16,
+    /*.op                         =*/ LLM_FUSED_OP_GDN_CH,
+    /*.name                       =*/ "fused Gated Delta Net (chunked)",
+    /*.n_tokens_per_seq           =*/ 16,
+    /*.allow_op_offload_cpu_layer =*/ true,
 };
 
 static const llm_fused_op_probe llm_fused_op_lid_probe = {
@@ -499,7 +503,11 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // but is still wrong for cases like --no-kv-offload.
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
 
-            if (device_fused != device_layer) {
+            const bool is_device_mismatch = device_fused != device_layer && (!probe.allow_op_offload_cpu_layer ||
+                    !cparams.op_offload ||
+                    ggml_backend_dev_type(device_layer) != GGML_BACKEND_DEVICE_TYPE_CPU ||
+                    ggml_backend_dev_type(device_fused) == GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (is_device_mismatch) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
                         "is assigned to device %s (usually due to missing support)\n",
                         func, node.il,

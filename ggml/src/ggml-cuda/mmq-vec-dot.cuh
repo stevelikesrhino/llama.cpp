@@ -1249,3 +1249,156 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+#if defined(BLACKWELL_MMA_AVAILABLE)
+template <bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_nvfp4_tile_A(
+        tile<16, 8, int> & tile_a,
+        uint32_t & scale,
+        const block_nvfp4_blackwell * __restrict__ x,
+        const int nvfp4_blocks_per_row,
+        const int row_base,
+        const int frag_abs,
+        const int row_max) {
+    const int lane = int(threadIdx.x) & 31;
+    int row_lo_abs = row_base + (lane >> 2);
+    int row_hi_abs = row_lo_abs + 8;
+    if constexpr (fallback) {
+        row_lo_abs = min(row_lo_abs, row_max);
+        row_hi_abs = min(row_hi_abs, row_max);
+    }
+
+    const int block_rel = frag_abs / 4;
+    const int frag_idx  = frag_abs % 4;
+    const int word_idx  = lane & 3;
+    int * tx = (int *) tile_a.x;
+
+    if constexpr (!fallback) {
+        const block_nvfp4_blackwell_frag & frag =
+            x[(row_base / 16) * nvfp4_blocks_per_row + block_rel].tiles[frag_idx];
+        const uint4 packed = reinterpret_cast<const uint4 *>(frag.regs)[lane];
+        tx[0] = (int) packed.x;
+        tx[1] = (int) packed.y;
+        tx[2] = (int) packed.z;
+        tx[3] = (int) packed.w;
+        scale = frag.scales_u32[((lane >> 2) * 2) + (lane & 1)];
+        return;
+    }
+
+    const block_nvfp4_blackwell & block_lo =
+        x[(row_lo_abs / 16) * nvfp4_blocks_per_row + block_rel];
+    const block_nvfp4_blackwell & block_hi =
+        x[(row_hi_abs / 16) * nvfp4_blocks_per_row + block_rel];
+    const int row_lo = row_lo_abs % 16;
+    const int row_hi = row_hi_abs % 16;
+
+    tx[0] = (int) ggml_cuda_nvfp4_tile_q_word(block_lo, row_lo, frag_idx, word_idx + 0);
+    tx[1] = (int) ggml_cuda_nvfp4_tile_q_word(block_hi, row_hi, frag_idx, word_idx + 0);
+    tx[2] = (int) ggml_cuda_nvfp4_tile_q_word(block_lo, row_lo, frag_idx, word_idx + 4);
+    tx[3] = (int) ggml_cuda_nvfp4_tile_q_word(block_hi, row_hi, frag_idx, word_idx + 4);
+    scale = (lane & 1) == 0
+        ? ggml_cuda_nvfp4_tile_scale_word(block_lo, row_lo, frag_idx)
+        : ggml_cuda_nvfp4_tile_scale_word(block_hi, row_hi, frag_idx);
+}
+
+static __device__ __forceinline__ void ggml_cuda_mmq_load_nvfp4_tile_B(
+        tile<8, 8, int> & tile_b,
+        uint32_t & scale,
+        const block_nvfp4_mmq & y_block,
+        const int frag_idx) {
+    const int lane  = int(threadIdx.x) & 31;
+    const int group = lane & 3;
+    const uint32_t * __restrict__ y_qs = y_block.qs_u32 + frag_idx * 8;
+    int * tx = (int *) tile_b.x;
+
+    tx[0] = (int) y_qs[group + 0];
+    tx[1] = (int) y_qs[group + 4];
+
+    uint32_t scale_word = 0;
+    if (group == 0) {
+        scale_word = y_block.sc4_u32[frag_idx];
+    }
+    scale = __shfl_sync(0xFFFFFFFFu, scale_word, lane & ~3);
+}
+
+template <int J>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_nvfp4_tile_B(
+        tile<8, 8, int> & tile_b,
+        uint32_t & scale,
+        const block_nvfp4_mmq * __restrict__ y_blocks_j,
+        const int frag_idx) {
+    const int col = (int(threadIdx.x) & 31) >> 2;
+    ggml_cuda_mmq_load_nvfp4_tile_B(tile_b, scale, y_blocks_j[col], frag_idx);
+}
+
+template <int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_nvfp4_nvfp4_direct(
+        const block_nvfp4_blackwell * __restrict__ x_blocks,
+        const int stride_row_x,
+        const block_nvfp4_mmq * __restrict__ y,
+        float * __restrict__ sum,
+        const int k00,
+        const int i_max,
+        const float tensor_scale) {
+    typedef tile<16, 8, int>   tile_A;
+    typedef tile<8,  8, int>   tile_B;
+    typedef tile<16, 8, float> tile_C;
+
+    constexpr int nwarps          = ggml_cuda_mmq_get_nthreads(GGML_TYPE_NVFP4, J, fallback) /
+                                    ggml_cuda_get_physical_warp_size();
+    constexpr int I               = ggml_cuda_mmq_get_I(GGML_TYPE_NVFP4, J, fallback);
+    constexpr int rows_per_warp   = J >= 48 ? 32 : 16;
+    constexpr int ntx             = rows_per_warp / tile_C::I;
+    constexpr int rows_per_slab   = nwarps * tile_C::I;
+    constexpr int groups_per_slab = J / tile_C::J;
+
+    const int ty = threadIdx.y;
+    const int ty_ntx_mod = ty % ntx;
+    const int ty_ntx_div = ty / ntx;
+    const block_nvfp4_mmq * __restrict__ y_blocks = y + ty_ntx_mod * tile_C::J;
+
+#pragma unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 16) {
+        const int frag0 = k01 / 8;
+        const int frag1 = frag0 + 1;
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += ntx * tile_C::J) {
+            const block_nvfp4_mmq * __restrict__ y_blocks_j = y_blocks + j0;
+            tile_B B[2];
+            uint32_t scale_b[2];
+            ggml_cuda_mmq_load_nvfp4_tile_B<J>(B[0], scale_b[0], y_blocks_j, frag0);
+            ggml_cuda_mmq_load_nvfp4_tile_B<J>(B[1], scale_b[1], y_blocks_j, frag1);
+
+#pragma unroll
+            for (int slab_row0 = 0; slab_row0 < I; slab_row0 += rows_per_slab) {
+                tile_A A[ntx][2];
+                uint32_t scale_a[ntx][2];
+                const int i0 = slab_row0 + ty_ntx_div * rows_per_warp;
+                const int sum_j = slab_row0 / rows_per_slab * groups_per_slab + j0 / tile_C::J;
+
+#pragma unroll
+                for (int n = 0; n < ntx; ++n) {
+                    const int row_base = i0 + n * tile_A::I;
+                    ggml_cuda_mmq_load_nvfp4_tile_A<fallback>(
+                        A[n][0], scale_a[n][0], x_blocks, stride_row_x, row_base, k00 / 8 + frag0, i_max);
+                    ggml_cuda_mmq_load_nvfp4_tile_A<fallback>(
+                        A[n][1], scale_a[n][1], x_blocks, stride_row_x, row_base, k00 / 8 + frag1, i_max);
+                }
+
+#pragma unroll
+                for (int n = 0; n < ntx; ++n) {
+                    tile_C C[2];
+                    float * __restrict__ sum_n = sum + (sum_j + n) * tile_C::ne;
+                    mma_block_scaled_fp4<GGML_TYPE_NVFP4>(C[0], A[n][0], B[0], scale_a[n][0], scale_b[0]);
+                    mma_block_scaled_fp4<GGML_TYPE_NVFP4>(C[1], A[n][1], B[1], scale_a[n][1], scale_b[1]);
+#pragma unroll
+                    for (int l = 0; l < tile_C::ne; ++l) {
+                        sum_n[l] += tensor_scale * (C[0].x[l] + C[1].x[l]);
+                    }
+                }
+            }
+        }
+    }
+}
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+

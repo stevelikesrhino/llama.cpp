@@ -426,6 +426,121 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
     return spitch >= width && dpitch >= width;
 }
 
+#if defined(BLACKWELL_MMA_AVAILABLE)
+static const ggml_tensor * ggml_cuda_nvfp4_root(const ggml_tensor * tensor) {
+    return tensor->view_src != nullptr ? tensor->view_src : tensor;
+}
+
+static ggml_tensor * ggml_cuda_nvfp4_root(ggml_tensor * tensor) {
+    return tensor->view_src != nullptr ? tensor->view_src : tensor;
+}
+
+static bool ggml_cuda_nvfp4_covers_root(const ggml_tensor * tensor, const ggml_tensor * root) {
+    if (tensor != root && tensor->view_offs != 0) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (tensor->ne[i] != root->ne[i] || tensor->nb[i] != root->nb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static size_t ggml_cuda_nvfp4_logical_size(const ggml_tensor * tensor) {
+    return ggml_row_size(tensor->type, tensor->ne[0]) * ggml_nrows(tensor);
+}
+
+static void ggml_cuda_nvfp4_gather(
+        const ggml_tensor * tensor, const ggml_tensor * root, const char * root_data, char * contiguous) {
+    GGML_ASSERT(tensor->nb[0] == ggml_type_size(tensor->type));
+    const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+    const size_t view_offs = tensor == root ? 0 : tensor->view_offs;
+
+    size_t row = 0;
+    for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < tensor->ne[1]; ++i1) {
+                memcpy(contiguous + row++ * row_size,
+                    root_data + view_offs + i1 * tensor->nb[1] + i2 * tensor->nb[2] + i3 * tensor->nb[3],
+                    row_size);
+            }
+        }
+    }
+}
+
+static void ggml_cuda_nvfp4_scatter(
+        const ggml_tensor * tensor, const ggml_tensor * root, const char * contiguous, char * root_data) {
+    GGML_ASSERT(tensor->nb[0] == ggml_type_size(tensor->type));
+    const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+    const size_t view_offs = tensor == root ? 0 : tensor->view_offs;
+
+    size_t row = 0;
+    for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < tensor->ne[1]; ++i1) {
+                memcpy(root_data + view_offs + i1 * tensor->nb[1] + i2 * tensor->nb[2] + i3 * tensor->nb[3],
+                    contiguous + row++ * row_size, row_size);
+            }
+        }
+    }
+}
+
+static void ggml_cuda_cpy_nvfp4_repacked(
+        const ggml_tensor * src, ggml_tensor * dst, cudaStream_t stream) {
+    const ggml_tensor * src_root = ggml_cuda_nvfp4_root(src);
+    ggml_tensor * dst_root = ggml_cuda_nvfp4_root(dst);
+    const bool dst_covers_root = ggml_cuda_nvfp4_covers_root(dst, dst_root);
+
+    const size_t src_size = ggml_cuda_nvfp4_logical_size(src);
+    const size_t dst_size = ggml_cuda_nvfp4_logical_size(dst);
+    GGML_ASSERT(src_size == dst_size);
+
+    const size_t src_root_size = ggml_cuda_nvfp4_logical_size(src_root);
+    const size_t dst_root_size = ggml_cuda_nvfp4_logical_size(dst_root);
+    const size_t src_packed_size = ggml_cuda_nvfp4_tensor_alloc_size(src_root);
+    const size_t dst_packed_size = ggml_cuda_nvfp4_tensor_alloc_size(dst_root);
+
+    std::vector<char> src_packed(src_packed_size);
+    std::vector<char> src_root_data(src_root_size);
+    std::vector<char> copied(src_size);
+    std::vector<char> dst_packed(dst_packed_size);
+    std::vector<char> dst_root_data(dst_root_size);
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        src_packed.data(), src_root->data, src_packed_size, cudaMemcpyDeviceToHost, stream));
+    if (!dst_covers_root && dst_root != src_root) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            dst_packed.data(), dst_root->data, dst_packed_size, cudaMemcpyDeviceToHost, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    ggml_cuda_unpack_tensor_nvfp4(src_root, src_packed.data(), src_root_data.data());
+    ggml_cuda_nvfp4_gather(src, src_root, src_root_data.data(), copied.data());
+
+    if (dst_root == src_root) {
+        dst_root_data = src_root_data;
+        dst_packed = src_packed;
+    } else if (!dst_covers_root) {
+        ggml_cuda_unpack_tensor_nvfp4(dst_root, dst_packed.data(), dst_root_data.data());
+    }
+    ggml_cuda_nvfp4_scatter(dst, dst_root, copied.data(), dst_root_data.data());
+
+    alignas(block_nvfp4_blackwell_tensor) std::array<char, sizeof(block_nvfp4_blackwell_tensor)> header{};
+    if (dst_covers_root) {
+        memcpy(header.data(), src_packed.data(), header.size());
+    } else {
+        memcpy(header.data(), dst_packed.data(), header.size());
+    }
+    ggml_cuda_repack_tensor_nvfp4(dst_root, dst_root_data.data(), dst_packed.data());
+    memcpy(dst_packed.data(), header.data(), header.size());
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        dst_root->data, dst_packed.data(), dst_packed_size, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
     const int64_t ne = ggml_nelements(src0);
     GGML_ASSERT(ne == ggml_nelements(src1));
@@ -458,6 +573,27 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     char * src1_ddc = (char *) src1->data;
 
     const bool contiguous_srcs = ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool repacked_src0 = ggml_cuda_should_use_nvfp4_repack(src0->type, cc);
+    const bool repacked_src1 = ggml_cuda_should_use_nvfp4_repack(src1->type, cc);
+    if (repacked_src0 || repacked_src1) {
+        GGML_ASSERT(repacked_src0 && repacked_src1 && src0->type == src1->type);
+        const ggml_tensor * src0_root = ggml_cuda_nvfp4_root(src0);
+        const ggml_tensor * src1_root = ggml_cuda_nvfp4_root(src1);
+        const bool can_copy_physical = ggml_cuda_nvfp4_covers_root(src0, src0_root) &&
+            ggml_cuda_nvfp4_covers_root(src1, src1_root) && ggml_are_same_shape(src0, src1);
+        if (can_copy_physical) {
+            const size_t copy_size = ggml_cuda_nvfp4_tensor_alloc_size(src0_root);
+            GGML_ASSERT(copy_size == ggml_cuda_nvfp4_tensor_alloc_size(src1_root));
+            CUDA_CHECK(cudaMemcpyAsync(src1_root->data, src0_root->data, copy_size, cudaMemcpyDeviceToDevice, main_stream));
+        } else {
+            ggml_cuda_cpy_nvfp4_repacked(src0, src1, main_stream);
+        }
+        return;
+    }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+
     const bool can_be_transposed = nb01 == (int64_t)ggml_element_size(src0) &&
         src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0);
 

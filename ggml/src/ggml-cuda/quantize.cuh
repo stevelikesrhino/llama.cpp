@@ -16,17 +16,25 @@ typedef void (*quantize_cuda_t)(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+bool ggml_cuda_can_quantize_nvfp4_glu(const ggml_tensor * src);
+
 void quantize_row_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy,
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
+void quantize_row_q8_1_cuda(
+        const float * x, const int32_t * ids, void * vy,
+        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+        const float * scale_activation, int64_t scale_activation_ne, cudaStream_t stream);
 
 void quantize_mmq_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy,
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
-void quantize_mmq_fp4_cuda(const float *   x,
+void quantize_mmq_mxfp4_cuda(const float *   x,
                              const int32_t * ids,
                              void *          vy,
                              ggml_type       type_src0,
@@ -39,3 +47,28 @@ void quantize_mmq_fp4_cuda(const float *   x,
                              int64_t         ne2,
                              int64_t         ne3,
                              cudaStream_t    stream);
+
+void quantize_mmq_nvfp4_cuda(
+        const float * x, const int32_t * ids, void * vy,
+        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
+void quantize_mmq_nvfp4_cuda(
+        const float * x, const int32_t * ids, void * vy,
+        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+        const float * scale_activation, int64_t scale_activation_ne, cudaStream_t stream);
+
+void quantize_mmq_nvfp4_cuda(
+        const float * x, const int32_t * ids, const int32_t * ids_expert, void * vy,
+        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+        const float * scale_activation, int64_t scale_activation_ne, cudaStream_t stream);
+
+void quantize_mmq_nvfp4_glu_cuda(
+        const float * gate, const float * up, void * vy, ggml_type type_src0,
+        int64_t ne00,
+        int64_t gate_s01, int64_t gate_s02, int64_t gate_s03,
+        int64_t up_s01, int64_t up_s02, int64_t up_s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+        const float * scale_activation, int64_t scale_activation_ne, cudaStream_t stream);

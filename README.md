@@ -1,3 +1,11 @@
+# About this fork
+
+This is my llama.cpp fork for faster NVFP4 inference on SM120 GPUs, mainly RTX 50-series cards. It has repacked W4A4 CUDA paths and a bunch of NVFP4 optimizations.
+
+The original repack layout was written by [Michael Wand](https://github.com/michaelw9999). Runtime activation quantization uses adaptive 4/6 scaling based on MIT HAN Lab's [Four Over Six](https://arxiv.org/abs/2512.02010).
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

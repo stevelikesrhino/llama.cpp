@@ -9,6 +9,7 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -57,6 +58,14 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
             tmp[i] = ggml_fp32_to_fp16(dis(gen));
         }
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
+    } else if (tensor->type == GGML_TYPE_NVFP4) {
+        std::vector<float> src(ne);
+        for (int64_t i = 0; i < ne; i++) {
+            src[i] = dis(gen);
+        }
+        std::vector<uint8_t> tmp(ggml_nbytes(tensor));
+        ggml_quantize_chunk(tensor->type, src.data(), tmp.data(), 0, ggml_nrows(tensor), tensor->ne[0], nullptr);
+        ggml_backend_tensor_set(tensor, tmp.data(), 0, tmp.size());
     } else {
         GGML_ABORT("fatal error");
     }
@@ -77,7 +86,8 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(
+        const llm_arch arch, const bool moe, const bool nvfp4_merged = false, const bool nvfp4_sidecars = true) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 128;
@@ -245,6 +255,31 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ggml_format_name(&t, "convnext.%" PRIu32 ".dw.weight", il);
         gguf_add_tensor(ms.gguf_ctx, &t);
     }
+    if (nvfp4_merged) {
+        GGML_ASSERT(arch == LLM_ARCH_QWEN35MOE && moe);
+        ggml_tensor t;
+        memset(&t, 0, sizeof(ggml_tensor));
+        t.type  = GGML_TYPE_NVFP4;
+        t.ne[0] = n_embd;
+        t.ne[1] = 2 * n_ff;
+        t.ne[2] = 2;
+        t.ne[3] = 1;
+        ggml_set_name(&t, "blk.0.ffn_gate_up_exps.weight");
+        gguf_add_tensor(ms.gguf_ctx, &t);
+
+        if (nvfp4_sidecars) {
+            memset(&t, 0, sizeof(ggml_tensor));
+            t.type  = GGML_TYPE_F32;
+            t.ne[0] = 2;
+            t.ne[1] = 1;
+            t.ne[2] = 1;
+            t.ne[3] = 1;
+            ggml_set_name(&t, "blk.0.ffn_gate_up_exps.scale");
+            gguf_add_tensor(ms.gguf_ctx, &t);
+            ggml_set_name(&t, "blk.0.ffn_gate_up_exps.input_scale");
+            gguf_add_tensor(ms.gguf_ctx, &t);
+        }
+    }
     return ret;
 }
 
@@ -283,6 +318,27 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         throw std::runtime_error("failed to create llama context");
     }
     return std::make_pair(std::move(model), std::move(lctx));
+}
+
+static void test_merged_nvfp4_scale_loading(const size_t seed, const bool with_sidecars) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35MOE, true, true, with_sidecars);
+    GGML_ASSERT((gguf_find_tensor(gguf_ctx.get(), "blk.0.ffn_gate_up_exps.scale") >= 0) == with_sidecars);
+    GGML_ASSERT((gguf_find_tensor(gguf_ctx.get(), "blk.0.ffn_gate_up_exps.input_scale") >= 0) == with_sidecars);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+    const llama_layer & layer = model_and_ctx.first->layers[0];
+
+    GGML_ASSERT(layer.ffn_gate_up_exps != nullptr);
+    GGML_ASSERT(layer.ffn_gate_up_exps->type == GGML_TYPE_NVFP4);
+    GGML_ASSERT(layer.ffn_up_exps == nullptr);
+    if (!with_sidecars) {
+        return; // Virtual model fixtures synthesize missing optional tensors after the GGUF metadata check above.
+    }
+    GGML_ASSERT(layer.ffn_up_exps_s != nullptr);
+    GGML_ASSERT(layer.ffn_up_exps_in_s != nullptr);
+    GGML_ASSERT(strcmp(layer.ffn_up_exps_s->name, "blk.0.ffn_gate_up_exps.scale") == 0);
+    GGML_ASSERT(strcmp(layer.ffn_up_exps_in_s->name, "blk.0.ffn_gate_up_exps.input_scale") == 0);
+    GGML_ASSERT(layer.ffn_gate_up_exps->src[0] == layer.ffn_up_exps_s);
+    GGML_ASSERT(layer.ffn_gate_up_exps->src[1] == layer.ffn_up_exps_in_s);
 }
 
 static std::vector<float> get_logits(
@@ -695,6 +751,10 @@ int main(int argc, char ** argv) {
     try {
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
+        }
+        if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN35MOE) {
+            test_merged_nvfp4_scale_loading(seed, true);
+            test_merged_nvfp4_scale_loading(seed, false);
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {
