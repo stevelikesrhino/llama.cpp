@@ -3,6 +3,13 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+static bool ggml_cuda_is_aligned_float8(
+        const void * ptr, const size_t stride1, const size_t stride2, const size_t stride3) {
+    constexpr uintptr_t alignment = 32;
+    return (uintptr_t) ptr % alignment == 0 &&
+           stride1 % alignment == 0 && stride2 % alignment == 0 && stride3 % alignment == 0;
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -187,6 +194,11 @@ static void ggml_cuda_mul_mat_q_impl(
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
+        const bool use_dynamic_scale = use_native_nvfp4 && scale_x_q_d == nullptr;
+        if (use_dynamic_scale) {
+            src1_scale.alloc(ne13 * ne12 * ne11);
+        }
 
         {
             const int64_t s11 = src1->nb[1] / ts_src1;
@@ -203,13 +215,20 @@ static void ggml_cuda_mul_mat_q_impl(
                     const ggml_tensor * up   = src1->src[1];
                     const size_t ts_gate = ggml_type_size(gate->type);
                     const size_t ts_up   = ggml_type_size(up->type);
+                    const bool use_aligned_float8 =
+                        ggml_cuda_is_aligned_float8(gate->data, gate->nb[1], gate->nb[2], gate->nb[3]) &&
+                        ggml_cuda_is_aligned_float8(up->data,   up->nb[1],   up->nb[2],   up->nb[3]);
                     quantize_mmq_nvfp4_glu_cuda((const float *) gate->data, (const float *) up->data, src1_q8_1.get(), src0->type, ne10,
                                                 gate->nb[1] / ts_gate, gate->nb[2] / ts_gate, gate->nb[3] / ts_gate,
                                                 up->nb[1]   / ts_up,   up->nb[2]   / ts_up,   up->nb[3]   / ts_up,
-                                                ne10_padded, ne11, ne12, ne13, scale_x_q_d, scale_x_q_ne, stream);
+                                                ne10_padded, ne11, ne12, ne13, scale_x_q_d, scale_x_q_ne,
+                                                src1_scale.ptr, use_aligned_float8, stream);
                 } else {
-                    quantize_mmq_nvfp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
-                                            ne11, ne12, ne13, scale_x_q_d, scale_x_q_ne, stream);
+                    const bool use_aligned_float8 =
+                        ggml_cuda_is_aligned_float8(src1_d, src1->nb[1], src1->nb[2], src1->nb[3]);
+                    quantize_mmq_nvfp4_cuda(src1_d, nullptr, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                                            ne11, ne12, ne13, scale_x_q_d, scale_x_q_ne,
+                                            src1_scale.ptr, use_aligned_float8, stream);
                 }
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
             } else {
@@ -231,6 +250,7 @@ static void ggml_cuda_mul_mat_q_impl(
 
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src1_scale.ptr,
             ne00, ne01, ne1, s01_mmq, ne11, s1,
             ne02, ne12, s02_mmq, s12, s2,
             ne03, ne13, s03_mmq, s13, s3,
@@ -269,6 +289,11 @@ static void ggml_cuda_mul_mat_q_impl(
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
         ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+    ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
+    const bool use_dynamic_scale = use_native_nvfp4 && scale_x_q_d == nullptr;
+    if (use_dynamic_scale) {
+        src1_scale.alloc(ne12 * n_expert_used);
+    }
 
     const int64_t ne11_flat = ne12*n_expert_used;
     const int64_t ne12_flat = 1;
@@ -292,8 +317,11 @@ static void ggml_cuda_mul_mat_q_impl(
                                      ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
 #if defined(BLACKWELL_MMA_AVAILABLE)
         } else if (use_native_nvfp4) {
+            const bool use_aligned_float8 =
+                ggml_cuda_is_aligned_float8(src1_d, src1->nb[1], src1->nb[2], src1->nb[3]);
             quantize_mmq_nvfp4_cuda(src1_d, ids_src1.get(), ids_expert.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
-                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, scale_x_q_d, scale_x_q_ne, stream);
+                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, scale_x_q_d, scale_x_q_ne,
+                                    src1_scale.ptr, use_aligned_float8, stream);
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
         } else {
             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
@@ -315,6 +343,7 @@ static void ggml_cuda_mul_mat_q_impl(
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+        src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01_mmq, ne_get_rows, s1,
         ne02, ne02, s02_mmq, s12, s2,
         ne03, ne13, s03_mmq, s13, s3,
@@ -394,6 +423,7 @@ void ggml_cuda_op_mul_mat_q(
                             && src1_ncols == ne11;
     const mmq_args args = {
         src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, dst_dd_i,
+        nullptr,
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
