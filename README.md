@@ -1,6 +1,6 @@
 # About this fork
 
-This is my llama.cpp fork for faster NVFP4 inference on SM120 GPUs, mainly RTX 50-series cards. It has repacked W4A4 CUDA paths and a bunch of NVFP4 optimizations.
+This is my llama.cpp fork for faster NVFP4 inference on SM120 GPUs, mainly RTX 50-series cards. It has repacked W4A4 CUDA paths and a bunch of NVFP4 optimizations. Recently W4A8 (weight in NVFP4 while activations in FP8 E4M3) is also added, and can be toggled on with --nvfp4-w4a8 flag. W4A8 is generally recommended for coding or other precise tasks. W4A8 can also directly use W4A4 calibrated models, as the input scale consumption for W4A8 has the same effect as on W4A4 NVFP4 models.
 
 The original repack layout was written by [Michael Wand](https://github.com/michaelw9999). Runtime activation quantization uses adaptive 4/6 scaling based on MIT HAN Lab's [Four Over Six](https://arxiv.org/abs/2512.02010).
 
