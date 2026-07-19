@@ -1400,5 +1400,184 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_nvfp4_nvfp4_direct(
         }
     }
 }
+
+static __device__ __forceinline__ uint32_t ggml_cuda_w4a8_expand_e2m1x4(const uint32_t packed, const int half) {
+    const uint32_t p = half ? packed >> 16 : packed;
+    const uint32_t q = __byte_perm(p, p, 0x1100);
+    return ((q & 0x000F000Fu) << 2) | ((q & 0xF000F000u) >> 2);
+}
+
+static __device__ __forceinline__ uint32_t ggml_cuda_w4a8_scaled_e4m3x4(
+        const uint32_t expanded_e2m1, const half2 scale_h2) {
+    const uint32_t nibbles = (expanded_e2m1 >> 2) & 0x0F0F0F0Fu;
+    const __nv_fp4x2_storage_t fp4_lo = (nibbles & 0x0Fu) | ((nibbles >> 4) & 0xF0u);
+    const __nv_fp4x2_storage_t fp4_hi = ((nibbles >> 16) & 0x0Fu) | ((nibbles >> 20) & 0xF0u);
+    const half2 h2_lo = __hmul2(half2(__nv_cvt_fp4x2_to_halfraw2(fp4_lo, __NV_E2M1)), scale_h2);
+    const half2 h2_hi = __hmul2(half2(__nv_cvt_fp4x2_to_halfraw2(fp4_hi, __NV_E2M1)), scale_h2);
+    const uint32_t fp8_lo = __nv_cvt_halfraw2_to_fp8x2(h2_lo, __NV_SATFINITE, __NV_E4M3);
+    const uint32_t fp8_hi = __nv_cvt_halfraw2_to_fp8x2(h2_hi, __NV_SATFINITE, __NV_E4M3);
+    return fp8_lo | (fp8_hi << 16);
+}
+
+static __device__ __forceinline__ void ggml_cuda_mmq_w4a8_make_scaled_e4m3_tile_A(
+        tile<16, 8, int> & dst,
+        const tile<16, 8, int> & src,
+        const uint32_t scale_word_lo,
+        const uint32_t scale_word_hi,
+        const int pair) {
+    int * __restrict__ d = (int *) dst.x;
+    const int * __restrict__ s = (const int *) src.x;
+    const int lane = int(threadIdx.x) & 31;
+    const int lane_in_group = lane & 3;
+    const int src_reg = 2 * pair;
+    const int src_lane0 = (lane & ~3) + (lane_in_group >> 1);
+    const int src_lane1 = src_lane0 + 2;
+    const uint32_t lo0 = ggml_cuda_w4a8_expand_e2m1x4(
+        __shfl_sync(0xFFFFFFFFu, (uint32_t) s[src_reg + 0], src_lane0), lane_in_group & 1);
+    const uint32_t hi0 = ggml_cuda_w4a8_expand_e2m1x4(
+        __shfl_sync(0xFFFFFFFFu, (uint32_t) s[src_reg + 1], src_lane0), lane_in_group & 1);
+    const uint32_t lo1 = ggml_cuda_w4a8_expand_e2m1x4(
+        __shfl_sync(0xFFFFFFFFu, (uint32_t) s[src_reg + 0], src_lane1), lane_in_group & 1);
+    const uint32_t hi1 = ggml_cuda_w4a8_expand_e2m1x4(
+        __shfl_sync(0xFFFFFFFFu, (uint32_t) s[src_reg + 1], src_lane1), lane_in_group & 1);
+
+    // UE4M3 block scales are normalized up to 448. Divide by 8 before folding them into
+    // E4M3 weights so that max(E2M1) * max(UE4M3) remains representable (6 * 448 / 8 = 336).
+    const __nv_fp8x2_storage_t packed_scales_lo = (scale_word_lo >> (16 * pair)) & 0xFFFFu;
+    const __nv_fp8x2_storage_t packed_scales_hi = (scale_word_hi >> (16 * pair)) & 0xFFFFu;
+    const half2 inv_eight = __float2half2_rn(0.125f);
+    const half2 scales_lo = __hmul2(half2(__nv_cvt_fp8x2_to_halfraw2(packed_scales_lo, __NV_E4M3)), inv_eight);
+    const half2 scales_hi = __hmul2(half2(__nv_cvt_fp8x2_to_halfraw2(packed_scales_hi, __NV_E4M3)), inv_eight);
+    d[0] = (int) ggml_cuda_w4a8_scaled_e4m3x4(lo0, __half2half2(__low2half(scales_lo)));
+    d[1] = (int) ggml_cuda_w4a8_scaled_e4m3x4(hi0, __half2half2(__low2half(scales_hi)));
+    d[2] = (int) ggml_cuda_w4a8_scaled_e4m3x4(lo1, __half2half2(__high2half(scales_lo)));
+    d[3] = (int) ggml_cuda_w4a8_scaled_e4m3x4(hi1, __half2half2(__high2half(scales_hi)));
+}
+
+template <int J>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_w4a8_tile_B(
+        tile<8, 8, int> & tile_b,
+        const block_nvfp4_w4a8_mmq * __restrict__ y_blocks_j,
+        const int frag_idx) {
+    const int lane  = int(threadIdx.x) & 31;
+    const int col   = lane >> 2;
+    const int group = lane & 3;
+    const uint32_t * __restrict__ y_qs = (const uint32_t *) y_blocks_j[col].qs + frag_idx * 8;
+    int * tx = (int *) tile_b.x;
+    tx[0] = (int) y_qs[group + 0];
+    tx[1] = (int) y_qs[group + 4];
+}
+
+template <int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_nvfp4_w4a8_direct(
+        const block_nvfp4_blackwell * __restrict__ x_blocks,
+        const int stride_row_x,
+        const block_nvfp4_w4a8_mmq * __restrict__ y,
+        float * __restrict__ sum,
+        const int k00,
+        const int i_max,
+        const float tensor_scale) {
+    typedef tile<16, 8, int>   tile_A;
+    typedef tile<8,  8, int>   tile_B;
+    typedef tile<16, 8, float> tile_C;
+
+    constexpr int nwarps          = ggml_cuda_mmq_get_nthreads(GGML_TYPE_NVFP4, J, fallback) /
+                                    ggml_cuda_get_physical_warp_size();
+    constexpr int I               = ggml_cuda_mmq_get_I(GGML_TYPE_NVFP4, J, fallback);
+    constexpr int rows_per_warp   = J >= 48 ? 32 : 16;
+    constexpr int ntx             = rows_per_warp / tile_C::I;
+    constexpr int rows_per_slab   = nwarps * tile_C::I;
+    constexpr int groups_per_slab = J / tile_C::J;
+
+    const int ty = threadIdx.y;
+    const int ty_ntx_mod = ty % ntx;
+    const int ty_ntx_div = ty / ntx;
+    const int lane = int(threadIdx.x) & 31;
+    const block_nvfp4_w4a8_mmq * __restrict__ y_blocks = y + ty_ntx_mod * tile_C::J;
+
+    if constexpr (J >= 48) {
+#pragma unroll
+        for (int weight_frag = 0; weight_frag < 4; ++weight_frag) {
+#pragma unroll
+            for (int slab_row0 = 0; slab_row0 < I; slab_row0 += rows_per_slab) {
+                const int i0 = slab_row0 + ty_ntx_div * rows_per_warp;
+#pragma unroll
+                for (int n = 0; n < ntx; ++n) {
+                    tile_A A_packed;
+                    uint32_t scale_word;
+                    const int row_base = i0 + n * tile_A::I;
+                    ggml_cuda_mmq_load_nvfp4_tile_A<fallback>(
+                        A_packed, scale_word, x_blocks, stride_row_x, row_base, k00 / 8 + weight_frag, i_max);
+                    const uint32_t scale_word_lo = __shfl_sync(0xFFFFFFFFu, scale_word, lane & ~3);
+                    const uint32_t scale_word_hi = __shfl_sync(0xFFFFFFFFu, scale_word, (lane & ~3) + 1);
+
+#pragma unroll
+                    for (int pair = 0; pair < 2; ++pair) {
+                        tile_A A;
+                        ggml_cuda_mmq_w4a8_make_scaled_e4m3_tile_A(
+                            A, A_packed, scale_word_lo, scale_word_hi, pair);
+
+#pragma unroll
+                        for (int j0 = 0; j0 < J; j0 += ntx * tile_C::J) {
+                            const block_nvfp4_w4a8_mmq * __restrict__ y_blocks_j = y_blocks + j0;
+                            tile_B B;
+                            tile_C C = {};
+                            ggml_cuda_mmq_load_w4a8_tile_B<J>(B, y_blocks_j, 2 * weight_frag + pair);
+                            mma_fp8_fp8(C, A, B);
+                            const int sum_j = slab_row0 / rows_per_slab * groups_per_slab + j0 / tile_C::J;
+                            float * __restrict__ sum_n = sum + (sum_j + n) * tile_C::ne;
+#pragma unroll
+                            for (int l = 0; l < tile_C::ne; ++l) {
+                                sum_n[l] += C.x[l] * (8.0f * tensor_scale);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int weight_frag = 0; weight_frag < 4; ++weight_frag) {
+#pragma unroll
+            for (int j0 = 0; j0 < J; j0 += ntx * tile_C::J) {
+                const block_nvfp4_w4a8_mmq * __restrict__ y_blocks_j = y_blocks + j0;
+                tile_B B[2];
+                ggml_cuda_mmq_load_w4a8_tile_B<J>(B[0], y_blocks_j, 2 * weight_frag + 0);
+                ggml_cuda_mmq_load_w4a8_tile_B<J>(B[1], y_blocks_j, 2 * weight_frag + 1);
+
+#pragma unroll
+                for (int slab_row0 = 0; slab_row0 < I; slab_row0 += rows_per_slab) {
+                    const int i0 = slab_row0 + ty_ntx_div * rows_per_warp;
+                    const int sum_j = slab_row0 / rows_per_slab * groups_per_slab + j0 / tile_C::J;
+
+#pragma unroll
+                    for (int n = 0; n < ntx; ++n) {
+                        tile_A A_packed;
+                        uint32_t scale_word;
+                        const int row_base = i0 + n * tile_A::I;
+                        ggml_cuda_mmq_load_nvfp4_tile_A<fallback>(
+                            A_packed, scale_word, x_blocks, stride_row_x, row_base, k00 / 8 + weight_frag, i_max);
+                        const uint32_t scale_word_lo = __shfl_sync(0xFFFFFFFFu, scale_word, lane & ~3);
+                        const uint32_t scale_word_hi = __shfl_sync(0xFFFFFFFFu, scale_word, (lane & ~3) + 1);
+                        float * __restrict__ sum_n = sum + (sum_j + n) * tile_C::ne;
+
+#pragma unroll
+                        for (int pair = 0; pair < 2; ++pair) {
+                            tile_A A;
+                            tile_C C = {};
+                            ggml_cuda_mmq_w4a8_make_scaled_e4m3_tile_A(
+                                A, A_packed, scale_word_lo, scale_word_hi, pair);
+                            mma_fp8_fp8(C, A, B[pair]);
+#pragma unroll
+                            for (int l = 0; l < tile_C::ne; ++l) {
+                                sum_n[l] += C.x[l] * (8.0f * tensor_scale);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 

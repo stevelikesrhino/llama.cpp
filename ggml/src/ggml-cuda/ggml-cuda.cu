@@ -5766,9 +5766,12 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
 }
 
 static ggml_backend_t ggml_backend_cuda_device_init_backend(ggml_backend_dev_t dev, const char * params) {
-    GGML_UNUSED(params);
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
-    return ggml_backend_cuda_init(ctx->device);
+    ggml_backend_t backend = ggml_backend_cuda_init(ctx->device);
+    if (backend != nullptr && params != nullptr && strcmp(params, "nvfp4_w4a8=1") == 0) {
+        ((ggml_backend_cuda_context *) backend->context)->nvfp4_w4a8 = true;
+    }
+    return backend;
 }
 
 static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_backend_dev_t dev) {

@@ -1569,6 +1569,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                            }
                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
     add_opt(common_arg(
+        {"--nvfp4-w4a8"},
+        {"--no-nvfp4-w4a8"},
+        string_format("use FP8 E4M3 activations for native NVFP4 matrix multiplication (default: %s)",
+                      params.nvfp4_w4a8 ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.nvfp4_w4a8 = value;
+        }
+    ).set_env("LLAMA_ARG_NVFP4_W4A8"));
+    add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",
         [](common_params & params, const std::string & value) {
