@@ -496,6 +496,7 @@ struct common_params {
     enum llama_attention_type    attention_type    = LLAMA_ATTENTION_TYPE_UNSPECIFIED; // attention type for embeddings
     enum llama_flash_attn_type   flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_AUTO; // whether to use Flash Attention
     bool                         nvfp4_w4a8         = false; // use FP8 E4M3 activations with native NVFP4 MMQ
+    bool                         nvfp4_w4a44        = false; // use dual-plane E2M1 activations with native NVFP4 MMQ
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;

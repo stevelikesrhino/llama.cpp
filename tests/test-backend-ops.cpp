@@ -4481,13 +4481,15 @@ struct test_mul_mat_nvfp4_scales : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const bool use_input_scale;
     const float weight_scale = 1.5f;
     const float input_scale  = 0.75f;
 
-    test_mul_mat_nvfp4_scales(int64_t m, int64_t n, int64_t k) : m(m), n(n), k(k) {}
+    test_mul_mat_nvfp4_scales(int64_t m, int64_t n, int64_t k, bool use_input_scale)
+        : m(m), n(n), k(k), use_input_scale(use_input_scale) {}
 
     std::string vars() override {
-        return VARS_TO_STR5(m, n, k, weight_scale, input_scale);
+        return VARS_TO_STR6(m, n, k, use_input_scale, weight_scale, input_scale);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -4501,13 +4503,16 @@ struct test_mul_mat_nvfp4_scales : public test_case {
 
         ggml_tensor * weight_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
         ggml_set_name(weight_s, "test.weight.scale");
-        ggml_tensor * input_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-        ggml_set_name(input_s, "test.weight.input_scale");
-
         weight->src[0] = weight_s;
-        weight->src[1] = input_s;
+        if (use_input_scale) {
+            ggml_tensor * input_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_set_name(input_s, "test.weight.input_scale");
+            weight->src[1] = input_s;
+        }
         memcpy(&weight->op_params[0], &weight_scale, sizeof(weight_scale));
-        memcpy(&weight->op_params[1], &input_scale,  sizeof(input_scale));
+        if (use_input_scale) {
+            memcpy(&weight->op_params[1], &input_scale, sizeof(input_scale));
+        }
 
         ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
         ggml_set_name(input, "input");
@@ -4551,17 +4556,19 @@ struct test_mul_mat_id_nvfp4_scales : public test_case {
     const int64_t n;
     const int64_t k;
     const bool gate_up;
+    const bool use_input_scale;
     const std::array<float, 4> weight_scales = { 0.5f, 1.0f, 1.5f, 2.0f };
     const std::array<float, 4> input_scales  = { 0.75f, 1.25f, 0.625f, 1.5f };
 
-    test_mul_mat_id_nvfp4_scales(int n_mats, int n_used, int64_t m, int64_t n, int64_t k, bool gate_up)
-        : n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), gate_up(gate_up) {
+    test_mul_mat_id_nvfp4_scales(
+            int n_mats, int n_used, int64_t m, int64_t n, int64_t k, bool gate_up, bool use_input_scale)
+        : n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), gate_up(gate_up), use_input_scale(use_input_scale) {
         GGML_ASSERT(n_mats == (int) weight_scales.size());
         GGML_ASSERT(n_used <= n_mats);
     }
 
     std::string vars() override {
-        return VARS_TO_STR6(n_mats, n_used, m, n, k, gate_up);
+        return VARS_TO_STR7(n_mats, n_used, m, n, k, gate_up, use_input_scale);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -4579,10 +4586,12 @@ struct test_mul_mat_id_nvfp4_scales : public test_case {
         ggml_set_name(weights, weight_name);
         ggml_tensor * weight_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_mats);
         ggml_set_name(weight_s, scale_name);
-        ggml_tensor * input_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_mats);
-        ggml_set_name(input_s, input_scale_name);
         weights->src[0] = weight_s;
-        weights->src[1] = input_s;
+        if (use_input_scale) {
+            ggml_tensor * input_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_mats);
+            ggml_set_name(input_s, input_scale_name);
+            weights->src[1] = input_s;
+        }
 
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
         ggml_set_name(ids, "ids");
@@ -4652,13 +4661,15 @@ struct test_mul_mat_nvfp4_glu : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
+    const bool use_input_scale;
     const float weight_scale = 1.5f;
     const float input_scale  = 0.75f;
 
-    test_mul_mat_nvfp4_glu(int64_t m, int64_t n, int64_t k) : m(m), n(n), k(k) {}
+    test_mul_mat_nvfp4_glu(int64_t m, int64_t n, int64_t k, bool use_input_scale)
+        : m(m), n(n), k(k), use_input_scale(use_input_scale) {}
 
     std::string vars() override {
-        return VARS_TO_STR5(m, n, k, weight_scale, input_scale);
+        return VARS_TO_STR6(m, n, k, use_input_scale, weight_scale, input_scale);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -4677,12 +4688,16 @@ struct test_mul_mat_nvfp4_glu : public test_case {
         ggml_set_name(weight, "down.weight");
         ggml_tensor * weight_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
         ggml_set_name(weight_s, "down.weight.scale");
-        ggml_tensor * input_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-        ggml_set_name(input_s, "down.weight.input_scale");
         weight->src[0] = weight_s;
-        weight->src[1] = input_s;
+        if (use_input_scale) {
+            ggml_tensor * input_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_set_name(input_s, "down.weight.input_scale");
+            weight->src[1] = input_s;
+        }
         memcpy(&weight->op_params[0], &weight_scale, sizeof(weight_scale));
-        memcpy(&weight->op_params[1], &input_scale,  sizeof(input_scale));
+        if (use_input_scale) {
+            memcpy(&weight->op_params[1], &input_scale, sizeof(input_scale));
+        }
 
         ggml_tensor * out = ggml_mul_mat(ctx, weight, glu);
         ggml_set_name(out, "out");
@@ -9288,10 +9303,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
-    test_cases.emplace_back(new test_mul_mat_nvfp4_scales(64, 16, 256));
-    test_cases.emplace_back(new test_mul_mat_id_nvfp4_scales(4, 2, 64, 16, 256, false));
-    test_cases.emplace_back(new test_mul_mat_id_nvfp4_scales(4, 2, 64, 16, 256, true));
-    test_cases.emplace_back(new test_mul_mat_nvfp4_glu(64, 16, 256));
+    for (bool use_input_scale : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_nvfp4_scales(64, 16, 256, use_input_scale));
+        test_cases.emplace_back(new test_mul_mat_nvfp4_scales(128, 1, 512, use_input_scale));
+        test_cases.emplace_back(new test_mul_mat_id_nvfp4_scales(4, 2, 64, 16, 256, false, use_input_scale));
+        test_cases.emplace_back(new test_mul_mat_id_nvfp4_scales(4, 2, 128, 1, 512, false, use_input_scale));
+        test_cases.emplace_back(new test_mul_mat_id_nvfp4_scales(4, 2, 64, 16, 256, true, use_input_scale));
+        test_cases.emplace_back(new test_mul_mat_id_nvfp4_scales(4, 2, 128, 1, 512, true, use_input_scale));
+        test_cases.emplace_back(new test_mul_mat_nvfp4_glu(64, 16, 256, use_input_scale));
+        test_cases.emplace_back(new test_mul_mat_nvfp4_glu(128, 1, 512, use_input_scale));
+    }
     test_cases.emplace_back(new test_nvfp4_repack_buffer_ops());
 
     // gpt-oss issue with Vulkan mmq_id
@@ -10384,7 +10405,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_from_file(const c
 }
 
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
-                         printer * output_printer, const char * test_file_path, int parallel_workers) {
+                         printer * output_printer, const char * test_file_path, int parallel_workers, const char * backend_params) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
         if (params_filter == nullptr) {
             return;
@@ -10486,7 +10507,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             std::atomic<size_t> workers_started = 0;
 
             const auto & eval_worker = [&]() {
-                ggml_backend_ptr b(ggml_backend_dev_init(dev, NULL));
+                ggml_backend_ptr b(ggml_backend_dev_init(dev, backend_params));
                 if (b == NULL) {
                     return;
                 }
@@ -10668,7 +10689,7 @@ static void show_test_coverage() {
 
 static void usage(char ** argv) {
     printf("Usage: %s [mode] [-o <op,..>] [-b <backend>] [-p <params regex>] [--output <console|sql|csv>] [--list-ops]", argv[0]);
-    printf(" [--show-coverage] [--test-file <path>] [-j <n>]\n");
+    printf(" [--show-coverage] [--test-file <path>] [--backend-params <params>] [-j <n>]\n");
     printf("    valid modes:\n");
     printf("      - test (default, compare with CPU backend for correctness)\n");
     printf("      - grad (compare gradients from backpropagation with method of finite differences)\n");
@@ -10680,6 +10701,7 @@ static void usage(char ** argv) {
     printf("    --list-ops lists all available GGML operations\n");
     printf("    --show-coverage shows test coverage\n");
     printf("    --test-file reads test operators from a test file generated by test-export-graph-ops\n");
+    printf("    --backend-params passes parameters to backend initialization\n");
     printf("    -j <n> runs tests using <n> parallel worker threads (default: 1, test mode only)\n");
 }
 
@@ -10690,6 +10712,7 @@ int main(int argc, char ** argv) {
     const char * backend_filter = nullptr;
     const char * params_filter = nullptr;
     const char * test_file_path = nullptr;
+    const char * backend_params = nullptr;
     int parallel_workers = 1;
 
     for (int i = 1; i < argc; i++) {
@@ -10745,6 +10768,13 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--backend-params") == 0) {
+            if (i + 1 < argc) {
+                backend_params = argv[++i];
+            } else {
+                usage(argv);
+                return 1;
+            }
         } else if (strcmp(argv[i], "-j") == 0) {
             if (i + 1 < argc) {
                 parallel_workers = atoi(argv[++i]);
@@ -10792,7 +10822,7 @@ int main(int argc, char ** argv) {
             continue;
         }
 
-        ggml_backend_ptr backend(ggml_backend_dev_init(dev, NULL));
+        ggml_backend_ptr backend(ggml_backend_dev_init(dev, backend_params));
         GGML_ASSERT(backend != NULL);
 
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -10808,7 +10838,8 @@ int main(int argc, char ** argv) {
                                                              false, "", ggml_backend_dev_description(dev),
                                                              total / 1024 / 1024, free / 1024 / 1024, true));
 
-        bool ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers);
+        bool ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path,
+                               parallel_workers, backend_params);
 
         if (ok) {
             n_ok++;

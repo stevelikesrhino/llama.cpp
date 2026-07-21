@@ -1575,8 +1575,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                       params.nvfp4_w4a8 ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.nvfp4_w4a8 = value;
+            if (value) {
+                params.nvfp4_w4a44 = false;
+            }
         }
     ).set_env("LLAMA_ARG_NVFP4_W4A8"));
+    add_opt(common_arg(
+        {"--nvfp4-w4a44"},
+        {"--no-nvfp4-w4a44"},
+        string_format("use dual-plane E2M1 activations for native NVFP4 matrix multiplication (default: %s)",
+                      params.nvfp4_w4a44 ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.nvfp4_w4a44 = value;
+            if (value) {
+                params.nvfp4_w4a8 = false;
+            }
+        }
+    ).set_env("LLAMA_ARG_NVFP4_W4A44"));
     add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",

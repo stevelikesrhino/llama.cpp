@@ -385,6 +385,7 @@ extern "C" {
                           //       ref: https://github.com/ggml-org/llama.cpp/pull/13845#issuecomment-2924800573
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
         bool nvfp4_w4a8;  // use FP8 E4M3 activations for native NVFP4 matrix multiplication
+        bool nvfp4_w4a44; // use dual-plane E2M1 activations for native NVFP4 matrix multiplication
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 

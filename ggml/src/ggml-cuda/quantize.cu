@@ -215,6 +215,30 @@ static __device__ __forceinline__ void ggml_cuda_nvfp4_quantize_4o6_mse(
     fp8_code = use4 ? fp8_code4 : fp8_code6;
 }
 
+static __device__ __forceinline__ void ggml_cuda_nvfp4_quantize_4o6_residual(
+        const float (&vals0)[8], const float (&vals1)[8], const float sub_max,
+        uint32_t & plane0_0, uint32_t & plane0_1,
+        uint32_t & plane1_0, uint32_t & plane1_1,
+        uint8_t & fp8_code) {
+    ggml_cuda_nvfp4_quantize_4o6_mse(vals0, vals1, sub_max, plane0_0, plane0_1, fp8_code);
+
+    const float subblock_scale = ggml_cuda_ue4m3_to_fp32(fp8_code);
+    const float dequant_scale  = 2.0f * subblock_scale;
+    float residual0[8];
+    float residual1[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const float q0 = 0.5f * (float) kvalues_mxfp4[(plane0_0 >> (4 * k)) & 0x0Fu];
+        const float q1 = 0.5f * (float) kvalues_mxfp4[(plane0_1 >> (4 * k)) & 0x0Fu];
+        residual0[k] = 12.0f * (vals0[k] / dequant_scale - q0);
+        residual1[k] = 12.0f * (vals1[k] / dequant_scale - q1);
+    }
+
+    float residual_err = 0.0f;
+    plane1_0 = ggml_cuda_fp32x8_to_fp4_e2m1_mse(residual0, 1.0f, 1.0f, residual_err);
+    plane1_1 = ggml_cuda_fp32x8_to_fp4_e2m1_mse(residual1, 1.0f, 1.0f, residual_err);
+}
+
 bool ggml_cuda_can_quantize_nvfp4_glu(const ggml_tensor * src) {
     if (src == nullptr || src->op != GGML_OP_GLU || ggml_get_glu_op(src) != GGML_GLU_OP_SWIGLU) {
         return false;
@@ -792,6 +816,219 @@ static __global__ void quantize_mmq_nvfp4_w4a8_glu(
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
 
+template <bool has_ids, bool has_scale, bool dynamic_scale>
+static __global__ void quantize_mmq_nvfp4_w4a44(
+        const float * __restrict__ x,
+        const int32_t * __restrict__ ids,
+        const int32_t * __restrict__ ids_expert,
+        block_nvfp4_w4a44_mmq * __restrict__ y,
+        const float * __restrict__ scale_activation,
+        float * __restrict__ scale_dynamic,
+        const int64_t scale_activation_ne,
+        const int64_t ne00,
+        const int64_t s01,
+        const int64_t s02,
+        const int64_t s03,
+        const int64_t ne0,
+        const int64_t ne1,
+        const int64_t ne2) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const int64_t i1  = blockIdx.x;
+    const int64_t i2  = blockIdx.y % ne2;
+    const int64_t i3  = blockIdx.y / ne2;
+    const int64_t i01 = has_ids ? ids[i1] : i1;
+    const float * __restrict__ x_row = x + i3 * s03 + i2 * s02 + i01 * s01;
+
+    __shared__ float row_scale_shared;
+    if constexpr (dynamic_scale) {
+        float amax = 0.0f;
+        for (int64_t i0 = threadIdx.x; i0 < ne00; i0 += blockDim.x) {
+            amax = fmaxf(amax, fabsf(x_row[i0]));
+        }
+        amax = warp_reduce_max<WARP_SIZE>(amax);
+
+        __shared__ float warp_amax[2 * CUDA_QUANTIZE_BLOCK_SIZE / WARP_SIZE];
+        const int lane = threadIdx.x % WARP_SIZE;
+        const int warp = threadIdx.x / WARP_SIZE;
+        if (lane == 0) {
+            warp_amax[warp] = amax;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            amax = lane < blockDim.x / WARP_SIZE ? warp_amax[lane] : 0.0f;
+            amax = warp_reduce_max<WARP_SIZE>(amax);
+            if (lane == 0) {
+                row_scale_shared = amax / (6.0f * 448.0f);
+                scale_dynamic[(int64_t) blockIdx.y * ne1 + i1] = row_scale_shared;
+            }
+        }
+    } else if constexpr (has_scale) {
+        if (threadIdx.x == 0) {
+            const int64_t scale_idx = scale_activation_ne <= 1 ? 0 :
+                (has_ids && ids_expert ? ids_expert[i1] : i01);
+            float input_scale = scale_activation[scale_idx];
+            if (!(input_scale > 0.0f) || !isfinite(input_scale)) {
+                input_scale = 1.0f;
+            }
+            row_scale_shared = input_scale;
+        }
+    } else if (threadIdx.x == 0) {
+        row_scale_shared = 1.0f;
+    }
+    __syncthreads();
+
+    const float inv_scale = row_scale_shared > 0.0f ? 1.0f / row_scale_shared : 0.0f;
+    const int64_t blocks_per_col = (ne0 + QK_K - 1) / QK_K;
+    const int64_t n_subblocks = (ne0 + QK_NVFP4_SUB - 1) / QK_NVFP4_SUB;
+    const int64_t batch_offset = (int64_t) blockIdx.y * (blocks_per_col * ne1);
+    for (int64_t isb = threadIdx.x; isb < n_subblocks; isb += blockDim.x) {
+        const int64_t i0_base = isb * QK_NVFP4_SUB;
+        const int64_t k_block = i0_base / QK_K;
+        const int sub = (i0_base % QK_K) / QK_NVFP4_SUB;
+        block_nvfp4_w4a44_mmq * yb = y + batch_offset + k_block * ne1 + i1;
+
+        float vals0[8];
+        float vals1[8];
+        ggml_cuda_load_nvfp4_values<false>(x_row, i0_base, ne00, vals0, vals1);
+        float sub_max = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            vals0[k] *= inv_scale;
+            vals1[k] *= inv_scale;
+            sub_max = fmaxf(sub_max, fabsf(vals0[k]));
+            sub_max = fmaxf(sub_max, fabsf(vals1[k]));
+        }
+
+        uint32_t plane0_0;
+        uint32_t plane0_1;
+        uint32_t plane1_0;
+        uint32_t plane1_1;
+        uint8_t fp8_code;
+        ggml_cuda_nvfp4_quantize_4o6_residual(
+            vals0, vals1, sub_max, plane0_0, plane0_1, plane1_0, plane1_1, fp8_code);
+        yb->qs0_u32[2 * sub + 0] = plane0_0;
+        yb->qs0_u32[2 * sub + 1] = plane0_1;
+        yb->qs1_u32[2 * sub + 0] = plane1_0;
+        yb->qs1_u32[2 * sub + 1] = plane1_1;
+        reinterpret_cast<uint8_t *>(yb->sc4_u32)[sub] = fp8_code;
+    }
+#else
+    GGML_UNUSED_VARS(x, ids, ids_expert, y, scale_activation, scale_dynamic, scale_activation_ne,
+                     ne00, s01, s02, s03, ne0, ne1, ne2);
+    NO_DEVICE_CODE;
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+}
+
+template <bool has_scale, bool dynamic_scale>
+static __global__ void quantize_mmq_nvfp4_w4a44_glu(
+        const float * __restrict__ gate,
+        const float * __restrict__ up,
+        block_nvfp4_w4a44_mmq * __restrict__ y,
+        const float * __restrict__ scale_activation,
+        float * __restrict__ scale_dynamic,
+        const int64_t scale_activation_ne,
+        const int64_t ne00,
+        const int64_t gate_s01,
+        const int64_t gate_s02,
+        const int64_t gate_s03,
+        const int64_t up_s01,
+        const int64_t up_s02,
+        const int64_t up_s03,
+        const int64_t ne0,
+        const int64_t ne1,
+        const int64_t ne2) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const int64_t i1 = blockIdx.x;
+    const int64_t i2 = blockIdx.y % ne2;
+    const int64_t i3 = blockIdx.y / ne2;
+    const float * __restrict__ gate_row = gate + i3 * gate_s03 + i2 * gate_s02 + i1 * gate_s01;
+    const float * __restrict__ up_row   = up   + i3 * up_s03   + i2 * up_s02   + i1 * up_s01;
+
+    __shared__ float row_scale_shared;
+    if constexpr (dynamic_scale) {
+        float amax = 0.0f;
+        for (int64_t i0 = threadIdx.x; i0 < ne00; i0 += blockDim.x) {
+            const float value = ggml_cuda_op_silu_single(gate_row[i0]) * up_row[i0];
+            amax = fmaxf(amax, fabsf(value));
+        }
+        amax = warp_reduce_max<WARP_SIZE>(amax);
+
+        __shared__ float warp_amax[CUDA_QUANTIZE_BLOCK_SIZE / WARP_SIZE];
+        const int lane = threadIdx.x % WARP_SIZE;
+        const int warp = threadIdx.x / WARP_SIZE;
+        if (lane == 0) {
+            warp_amax[warp] = amax;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            amax = lane < CUDA_QUANTIZE_BLOCK_SIZE / WARP_SIZE ? warp_amax[lane] : 0.0f;
+            amax = warp_reduce_max<WARP_SIZE>(amax);
+            if (lane == 0) {
+                row_scale_shared = amax / (6.0f * 448.0f);
+                scale_dynamic[(int64_t) blockIdx.y * ne1 + i1] = row_scale_shared;
+            }
+        }
+    } else if constexpr (has_scale) {
+        if (threadIdx.x == 0) {
+            const int64_t scale_idx = scale_activation_ne <= 1 ? 0 : i1;
+            float input_scale = scale_activation[scale_idx];
+            if (!(input_scale > 0.0f) || !isfinite(input_scale)) {
+                input_scale = 1.0f;
+            }
+            row_scale_shared = input_scale;
+        }
+    } else if (threadIdx.x == 0) {
+        row_scale_shared = 1.0f;
+    }
+    __syncthreads();
+
+    const float inv_scale = row_scale_shared > 0.0f ? 1.0f / row_scale_shared : 0.0f;
+    const int64_t blocks_per_col = (ne0 + QK_K - 1) / QK_K;
+    const int64_t n_subblocks = (ne0 + QK_NVFP4_SUB - 1) / QK_NVFP4_SUB;
+    const int64_t batch_offset = (int64_t) blockIdx.y * (blocks_per_col * ne1);
+    for (int64_t isb = threadIdx.x; isb < n_subblocks; isb += blockDim.x) {
+        const int64_t i0_base = isb * QK_NVFP4_SUB;
+        const int64_t k_block = i0_base / QK_K;
+        const int sub = (i0_base % QK_K) / QK_NVFP4_SUB;
+        block_nvfp4_w4a44_mmq * yb = y + batch_offset + k_block * ne1 + i1;
+
+        float gate0[8];
+        float gate1[8];
+        float up0[8];
+        float up1[8];
+        ggml_cuda_load_nvfp4_values<false>(gate_row, i0_base, ne00, gate0, gate1);
+        ggml_cuda_load_nvfp4_values<false>(up_row,   i0_base, ne00, up0,   up1);
+        float vals0[8];
+        float vals1[8];
+        float sub_max = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            vals0[k] = ggml_cuda_op_silu_single(gate0[k]) * up0[k] * inv_scale;
+            vals1[k] = ggml_cuda_op_silu_single(gate1[k]) * up1[k] * inv_scale;
+            sub_max = fmaxf(sub_max, fabsf(vals0[k]));
+            sub_max = fmaxf(sub_max, fabsf(vals1[k]));
+        }
+
+        uint32_t plane0_0;
+        uint32_t plane0_1;
+        uint32_t plane1_0;
+        uint32_t plane1_1;
+        uint8_t fp8_code;
+        ggml_cuda_nvfp4_quantize_4o6_residual(
+            vals0, vals1, sub_max, plane0_0, plane0_1, plane1_0, plane1_1, fp8_code);
+        yb->qs0_u32[2 * sub + 0] = plane0_0;
+        yb->qs0_u32[2 * sub + 1] = plane0_1;
+        yb->qs1_u32[2 * sub + 0] = plane1_0;
+        yb->qs1_u32[2 * sub + 1] = plane1_1;
+        reinterpret_cast<uint8_t *>(yb->sc4_u32)[sub] = fp8_code;
+    }
+#else
+    GGML_UNUSED_VARS(gate, up, y, scale_activation, scale_dynamic, scale_activation_ne, ne00,
+                     gate_s01, gate_s02, gate_s03, up_s01, up_s02, up_s03, ne0, ne1, ne2);
+    NO_DEVICE_CODE;
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+}
+
 // quantize values in the format mxfp4 is stored which is interleaved nibbles
 // i.e. a block a0-a31 is represented as a0a16,a1a17 ...a15a31
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
@@ -1281,6 +1518,75 @@ void quantize_mmq_nvfp4_w4a8_glu_cuda(
     } else {
         quantize_mmq_nvfp4_w4a8_glu<false, false><<<blocks, threads, 0, stream>>>(
             gate, up, (block_nvfp4_w4a8_mmq *) vy, nullptr, nullptr, 0, ne00,
+            gate_s01, gate_s02, gate_s03, up_s01, up_s02, up_s03, ne0, ne1, ne2);
+    }
+}
+
+void quantize_mmq_nvfp4_w4a44_cuda(
+        const float * x, const int32_t * ids, const int32_t * ids_expert, void * vy,
+        const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const float * scale_activation, const int64_t scale_activation_ne,
+        float * scale_dynamic, cudaStream_t stream) {
+    GGML_ASSERT(type_src0 == GGML_TYPE_NVFP4);
+    GGML_ASSERT(ne0 > 0);
+    GGML_ASSERT(!scale_activation || !scale_dynamic);
+
+    const dim3 blocks(ne1, ne2 * ne3, 1);
+    const dim3 threads(ne1 <= 8 ? 2 * CUDA_QUANTIZE_BLOCK_SIZE : CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    if (scale_dynamic) {
+        if (ids) {
+            quantize_mmq_nvfp4_w4a44<true, false, true><<<blocks, threads, 0, stream>>>(
+                x, ids, ids_expert, (block_nvfp4_w4a44_mmq *) vy, nullptr, scale_dynamic, 0,
+                ne00, s01, s02, s03, ne0, ne1, ne2);
+        } else {
+            quantize_mmq_nvfp4_w4a44<false, false, true><<<blocks, threads, 0, stream>>>(
+                x, nullptr, nullptr, (block_nvfp4_w4a44_mmq *) vy, nullptr, scale_dynamic, 0,
+                ne00, s01, s02, s03, ne0, ne1, ne2);
+        }
+    } else if (scale_activation) {
+        if (ids) {
+            quantize_mmq_nvfp4_w4a44<true, true, false><<<blocks, threads, 0, stream>>>(
+                x, ids, ids_expert, (block_nvfp4_w4a44_mmq *) vy, scale_activation, nullptr, scale_activation_ne,
+                ne00, s01, s02, s03, ne0, ne1, ne2);
+        } else {
+            quantize_mmq_nvfp4_w4a44<false, true, false><<<blocks, threads, 0, stream>>>(
+                x, nullptr, nullptr, (block_nvfp4_w4a44_mmq *) vy, scale_activation, nullptr, scale_activation_ne,
+                ne00, s01, s02, s03, ne0, ne1, ne2);
+        }
+    } else {
+        quantize_mmq_nvfp4_w4a44<false, false, false><<<blocks, threads, 0, stream>>>(
+            x, nullptr, nullptr, (block_nvfp4_w4a44_mmq *) vy, nullptr, nullptr, 0,
+            ne00, s01, s02, s03, ne0, ne1, ne2);
+    }
+}
+
+void quantize_mmq_nvfp4_w4a44_glu_cuda(
+        const float * gate, const float * up, void * vy, const ggml_type type_src0,
+        const int64_t ne00,
+        const int64_t gate_s01, const int64_t gate_s02, const int64_t gate_s03,
+        const int64_t up_s01, const int64_t up_s02, const int64_t up_s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const float * scale_activation, const int64_t scale_activation_ne,
+        float * scale_dynamic, cudaStream_t stream) {
+    GGML_ASSERT(type_src0 == GGML_TYPE_NVFP4);
+    GGML_ASSERT(ne0 > 0);
+    GGML_ASSERT(!scale_activation || !scale_dynamic);
+
+    const dim3 blocks(ne1, ne2 * ne3, 1);
+    const dim3 threads(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    if (scale_dynamic) {
+        quantize_mmq_nvfp4_w4a44_glu<false, true><<<blocks, threads, 0, stream>>>(
+            gate, up, (block_nvfp4_w4a44_mmq *) vy, nullptr, scale_dynamic, 0, ne00,
+            gate_s01, gate_s02, gate_s03, up_s01, up_s02, up_s03, ne0, ne1, ne2);
+    } else if (scale_activation) {
+        quantize_mmq_nvfp4_w4a44_glu<true, false><<<blocks, threads, 0, stream>>>(
+            gate, up, (block_nvfp4_w4a44_mmq *) vy, scale_activation, nullptr, scale_activation_ne, ne00,
+            gate_s01, gate_s02, gate_s03, up_s01, up_s02, up_s03, ne0, ne1, ne2);
+    } else {
+        quantize_mmq_nvfp4_w4a44_glu<false, false><<<blocks, threads, 0, stream>>>(
+            gate, up, (block_nvfp4_w4a44_mmq *) vy, nullptr, nullptr, 0, ne00,
             gate_s01, gate_s02, gate_s03, up_s01, up_s02, up_s03, ne0, ne1, ne2);
     }
 }

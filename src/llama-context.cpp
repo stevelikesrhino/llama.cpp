@@ -123,6 +123,7 @@ llama_context::llama_context(
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.nvfp4_w4a8             = params.nvfp4_w4a8;
+    cparams.nvfp4_w4a44            = params.nvfp4_w4a44;
     cparams.warmup                  = false;
 
     cparams.embeddings_layer_inp.resize(hparams.n_layer(), false);
@@ -313,6 +314,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
     LLAMA_LOG_INFO("%s: nvfp4_w4a8   = %s\n",   __func__, cparams.nvfp4_w4a8 ? "true" : "false");
+    LLAMA_LOG_INFO("%s: nvfp4_w4a44  = %s\n",   __func__, cparams.nvfp4_w4a44 ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
@@ -331,7 +333,8 @@ llama_context::llama_context(
     if (!hparams.vocab_only) {
         // GPU backends
         for (const auto & dev : model.devices) {
-            const char * backend_params = cparams.nvfp4_w4a8 ? "nvfp4_w4a8=1" : nullptr;
+            const char * backend_params = cparams.nvfp4_w4a44 ? "nvfp4_w4a44=1" :
+                                          cparams.nvfp4_w4a8  ? "nvfp4_w4a8=1"  : nullptr;
             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, backend_params);
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
@@ -3508,6 +3511,7 @@ llama_context_params llama_context_default_params() {
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.nvfp4_w4a8                 =*/ false,
+        /*.nvfp4_w4a44                =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

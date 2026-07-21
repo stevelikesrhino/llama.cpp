@@ -343,6 +343,7 @@ struct cmd_params {
     std::vector<bool>                no_kv_offload;
     std::vector<llama_flash_attn_type> flash_attn;
     bool                             nvfp4_w4a8;
+    bool                             nvfp4_w4a44;
     std::vector<std::vector<ggml_backend_dev_t>> devices;
     std::vector<std::vector<float>>  tensor_split;
     std::vector<std::vector<llama_model_tensor_buft_override>> tensor_buft_overrides;
@@ -389,6 +390,7 @@ static const cmd_params cmd_params_defaults = {
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
     /* nvfp4_w4a8           */ false,
+    /* nvfp4_w4a44          */ false,
     /* devices              */ { {} },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
     /* tensor_buft_overrides*/ { std::vector<llama_model_tensor_buft_override>{ { nullptr, nullptr } } },
@@ -462,6 +464,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -nkvo, --no-kv-offload <0|1>                (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>             (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  --nvfp4-w4a8                                use FP8 E4M3 activations for native NVFP4 MMQ (default: false)\n");
+    printf("  --nvfp4-w4a44                               use dual-plane E2M1 activations for native NVFP4 MMQ (default: false)\n");
     printf("  -dev, --device <dev0/dev1/...>              (default: auto)\n");
     printf("  -mmp, --mmap <0|1>                          (default: %s)\n", join(cmd_params_defaults.use_mmap, ",").c_str());
     printf("  -dio, --direct-io <0|1>                     (default: %s)\n", join(cmd_params_defaults.use_direct_io, ",").c_str());
@@ -829,8 +832,14 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.flash_attn.insert(params.flash_attn.end(), types.begin(), types.end());
             } else if (arg == "--nvfp4-w4a8") {
                 params.nvfp4_w4a8 = true;
+                params.nvfp4_w4a44 = false;
             } else if (arg == "--no-nvfp4-w4a8") {
                 params.nvfp4_w4a8 = false;
+            } else if (arg == "--nvfp4-w4a44") {
+                params.nvfp4_w4a44 = true;
+                params.nvfp4_w4a8 = false;
+            } else if (arg == "--no-nvfp4-w4a44") {
+                params.nvfp4_w4a44 = false;
             } else if (arg == "-mmp" || arg == "--mmap") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1175,6 +1184,7 @@ struct cmd_params_instance {
     bool               no_kv_offload;
     llama_flash_attn_type flash_attn;
     bool               nvfp4_w4a8;
+    bool               nvfp4_w4a44;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
@@ -1260,6 +1270,7 @@ struct cmd_params_instance {
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn;
         cparams.nvfp4_w4a8      = nvfp4_w4a8;
+        cparams.nvfp4_w4a44     = nvfp4_w4a44;
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
@@ -1323,6 +1334,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
                 /* .nvfp4_w4a8   = */ params.nvfp4_w4a8,
+                /* .nvfp4_w4a44  = */ params.nvfp4_w4a44,
                 /* .devices      = */ devs,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
@@ -1361,6 +1373,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
                 /* .nvfp4_w4a8   = */ params.nvfp4_w4a8,
+                /* .nvfp4_w4a44  = */ params.nvfp4_w4a44,
                 /* .devices      = */ devs,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,
@@ -1399,6 +1412,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
                 /* .nvfp4_w4a8   = */ params.nvfp4_w4a8,
+                /* .nvfp4_w4a44  = */ params.nvfp4_w4a44,
                 /* .devices      = */ devs,
                 /* .tensor_split = */ ts,
                 /* .tensor_buft_overrides = */ ot,

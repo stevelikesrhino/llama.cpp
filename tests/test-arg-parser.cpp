@@ -127,6 +127,33 @@ static void test(void) {
     assert(params.n_predict == 6789);
     assert(params.n_batch == 9090);
 
+    params.nvfp4_w4a8  = false;
+    params.nvfp4_w4a44 = false;
+    argv = {"binary_name", "--nvfp4-w4a8"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.nvfp4_w4a8);
+    assert(!params.nvfp4_w4a44);
+
+    argv = {"binary_name", "--nvfp4-w4a44"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(!params.nvfp4_w4a8);
+    assert(params.nvfp4_w4a44);
+
+    argv = {"binary_name", "--nvfp4-w4a44", "--nvfp4-w4a8"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.nvfp4_w4a8);
+    assert(!params.nvfp4_w4a44);
+
+    argv = {"binary_name", "--nvfp4-w4a8", "--nvfp4-w4a44"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(!params.nvfp4_w4a8);
+    assert(params.nvfp4_w4a44);
+
+    argv = {"binary_name", "--no-nvfp4-w4a44"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(!params.nvfp4_w4a8);
+    assert(!params.nvfp4_w4a44);
+
     // --draft cannot be used outside llama-speculative
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));

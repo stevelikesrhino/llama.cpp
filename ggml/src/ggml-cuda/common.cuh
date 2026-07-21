@@ -1410,6 +1410,7 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     bool nvfp4_w4a8 = false;
+    bool nvfp4_w4a44 = false;
     cudaEvent_t copy_event = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };

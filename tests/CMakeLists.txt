@@ -265,6 +265,23 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
+if (GGML_CUDA)
+    set(NVFP4_TEST_OPS "MUL_MAT_NVFP4_SCALES,MUL_MAT_ID_NVFP4_SCALES,MUL_MAT_ID_NVFP4_GATE_UP,MUL_MAT_NVFP4_GLU")
+    llama_test(
+        test-backend-ops
+        NAME test-backend-ops-nvfp4-w4a8
+        LABEL cuda
+        ARGS test -b CUDA0 --backend-params nvfp4_w4a8=1 -o ${NVFP4_TEST_OPS}
+    )
+    llama_test(
+        test-backend-ops
+        NAME test-backend-ops-nvfp4-w4a44
+        LABEL cuda
+        ARGS test -b CUDA0 --backend-params nvfp4_w4a44=1 -o ${NVFP4_TEST_OPS}
+    )
+    unset(NVFP4_TEST_OPS)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
