@@ -1560,6 +1560,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_w4a8_make_scaled_e4m3_tile_
 template <int J>
 static __device__ __forceinline__ void ggml_cuda_mmq_load_w4a8_tile_B(
         tile<8, 8, int> & tile_b,
+        uint32_t & scale_b,
         const block_nvfp4_w4a8_mmq * __restrict__ y_blocks_j,
         const int frag_idx) {
     const int lane  = int(threadIdx.x) & 31;
@@ -1569,6 +1570,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_w4a8_tile_B(
     int * tx = (int *) tile_b.x;
     tx[0] = (int) y_qs[group + 0];
     tx[1] = (int) y_qs[group + 4];
+    scale_b = reinterpret_cast<const uint8_t *>(y_blocks_j[col].sc8_u32)[frag_idx];
 }
 
 template <int J, bool fallback>
@@ -1624,9 +1626,10 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_nvfp4_w4a8_direct(
                         for (int j0 = 0; j0 < J; j0 += ntx * tile_C::J) {
                             const block_nvfp4_w4a8_mmq * __restrict__ y_blocks_j = y_blocks + j0;
                             tile_B B;
+                            uint32_t scale_b;
                             tile_C C = {};
-                            ggml_cuda_mmq_load_w4a8_tile_B<J>(B, y_blocks_j, 2 * weight_frag + pair);
-                            mma_fp8_fp8(C, A, B);
+                            ggml_cuda_mmq_load_w4a8_tile_B<J>(B, scale_b, y_blocks_j, 2 * weight_frag + pair);
+                            mma_mxfp8_fp8(C, A, B, scale_b);
                             const int sum_j = slab_row0 / rows_per_slab * groups_per_slab + j0 / tile_C::J;
                             float * __restrict__ sum_n = sum + (sum_j + n) * tile_C::ne;
 #pragma unroll
@@ -1645,8 +1648,9 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_nvfp4_w4a8_direct(
             for (int j0 = 0; j0 < J; j0 += ntx * tile_C::J) {
                 const block_nvfp4_w4a8_mmq * __restrict__ y_blocks_j = y_blocks + j0;
                 tile_B B[2];
-                ggml_cuda_mmq_load_w4a8_tile_B<J>(B[0], y_blocks_j, 2 * weight_frag + 0);
-                ggml_cuda_mmq_load_w4a8_tile_B<J>(B[1], y_blocks_j, 2 * weight_frag + 1);
+                uint32_t scale_b[2];
+                ggml_cuda_mmq_load_w4a8_tile_B<J>(B[0], scale_b[0], y_blocks_j, 2 * weight_frag + 0);
+                ggml_cuda_mmq_load_w4a8_tile_B<J>(B[1], scale_b[1], y_blocks_j, 2 * weight_frag + 1);
 
 #pragma unroll
                 for (int slab_row0 = 0; slab_row0 < I; slab_row0 += rows_per_slab) {
@@ -1670,7 +1674,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_nvfp4_w4a8_direct(
                             tile_C C = {};
                             ggml_cuda_mmq_w4a8_make_scaled_e4m3_tile_A(
                                 A, A_packed, scale_word_lo, scale_word_hi, pair);
-                            mma_fp8_fp8(C, A, B[pair]);
+                            mma_mxfp8_fp8(C, A, B[pair], scale_b[pair]);
 #pragma unroll
                             for (int l = 0; l < tile_C::ne; ++l) {
                                 sum_n[l] += C.x[l] * (8.0f * tensor_scale);

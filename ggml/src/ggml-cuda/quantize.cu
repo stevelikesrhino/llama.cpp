@@ -662,61 +662,51 @@ static __global__ void quantize_mmq_nvfp4_w4a8(
     const int64_t i01 = has_ids ? ids[i1] : i1;
     const float * __restrict__ x_row = x + i3 * s03 + i2 * s02 + i01 * s01;
 
-    float row_scale = 1.0f;
-    if constexpr (dynamic_scale) {
-        __shared__ float scale_shared;
-        float amax = 0.0f;
-        for (int64_t i0 = threadIdx.x; i0 < ne00; i0 += blockDim.x) {
-            amax = fmaxf(amax, fabsf(x_row[i0]));
-        }
-        amax = warp_reduce_max<WARP_SIZE>(amax);
-
-        __shared__ float warp_amax[2 * CUDA_QUANTIZE_BLOCK_SIZE / WARP_SIZE];
-        const int lane = threadIdx.x % WARP_SIZE;
-        const int warp = threadIdx.x / WARP_SIZE;
-        if (lane == 0) {
-            warp_amax[warp] = amax;
-        }
-        __syncthreads();
-        if (warp == 0) {
-            amax = lane < blockDim.x / WARP_SIZE ? warp_amax[lane] : 0.0f;
-            amax = warp_reduce_max<WARP_SIZE>(amax);
-            if (lane == 0) {
-                scale_shared = amax / 448.0f;
-                scale_dynamic[(int64_t) blockIdx.y * ne1 + i1] = scale_shared;
-            }
-        }
-        __syncthreads();
-        row_scale = scale_shared;
-    } else if constexpr (has_scale) {
+    GGML_UNUSED(scale_dynamic);
+    float inv_input_scale = 1.0f;
+    if constexpr (has_scale) {
         const int64_t scale_idx = scale_activation_ne <= 1 ? 0 :
             (has_ids && ids_expert ? ids_expert[i1] : i01);
-        float input_scale = 1.0f;
-        if (threadIdx.x % WARP_SIZE == 0) {
-            input_scale = scale_activation[scale_idx];
-            if (!(input_scale > 0.0f) || !isfinite(input_scale)) {
-                input_scale = 1.0f;
-            }
+        float input_scale = scale_activation[scale_idx];
+        if (!(input_scale > 0.0f) || !isfinite(input_scale)) {
+            input_scale = 1.0f;
         }
-        row_scale = 6.0f * __shfl_sync(0xFFFFFFFFu, input_scale, 0);
+        inv_input_scale = 1.0f / input_scale;
     }
 
-    const float inv_scale = row_scale > 0.0f ? 1.0f / row_scale : 0.0f;
     const int64_t blocks_per_col = (ne0 + QK_K - 1) / QK_K;
     const int64_t batch_offset = (int64_t) blockIdx.y * blocks_per_col * ne1;
-    for (int64_t i0 = 2 * threadIdx.x; i0 < ne0; i0 += 2 * blockDim.x) {
-        const int64_t k_block = i0 / QK_K;
-        const int offset = i0 % QK_K;
-        const float2 values = make_float2(
-            i0     < ne00 ? x_row[i0]     * inv_scale : 0.0f,
-            i0 + 1 < ne00 ? x_row[i0 + 1] * inv_scale : 0.0f);
-        const __nv_fp8x2_storage_t packed = __nv_cvt_float2_to_fp8x2(
-            values, __NV_SATFINITE, __NV_E4M3);
-        uint8_t * __restrict__ dst = y[batch_offset + k_block * ne1 + i1].qs + offset;
-        if (i0 + 1 < ne0) {
-            *reinterpret_cast<__nv_fp8x2_storage_t *>(dst) = packed;
-        } else {
-            dst[0] = static_cast<uint8_t>(packed);
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int nwarps = blockDim.x / WARP_SIZE;
+    const int64_t nfrags = (ne0 + 31) / 32;
+    const int64_t frag_stride = (int64_t) gridDim.z * nwarps;
+    for (int64_t frag = (int64_t) blockIdx.z * nwarps + warp; frag < nfrags; frag += frag_stride) {
+        const int64_t i0 = 32 * frag + 2 * lane;
+        const float2 values = lane < 16 ? make_float2(
+            i0     < ne00 ? x_row[i0]     * inv_input_scale : 0.0f,
+            i0 + 1 < ne00 ? x_row[i0 + 1] * inv_input_scale : 0.0f) : make_float2(0.0f, 0.0f);
+        const float amax = warp_reduce_max<WARP_SIZE>(fmaxf(fabsf(values.x), fabsf(values.y)));
+        uint32_t scale_code = lane == 0 ?
+            (uint32_t) __nv_cvt_float_to_e8m0(amax / 448.0f, __NV_SATFINITE, cudaRoundPosInf) : 0;
+        scale_code = __shfl_sync(0xFFFFFFFFu, scale_code, 0);
+        const float inv_scale = scale_code > 0 ? ldexpf(1.0f, 127 - (int) scale_code) : 0.0f;
+
+        const int64_t k_block = frag / 8;
+        const int frag_idx = frag % 8;
+        block_nvfp4_w4a8_mmq * __restrict__ yb = y + batch_offset + k_block * ne1 + i1;
+        if (lane == 0) {
+            reinterpret_cast<uint8_t *>(yb->sc8_u32)[frag_idx] = (uint8_t) scale_code;
+        }
+        if (lane < 16 && i0 < ne0) {
+            const __nv_fp8x2_storage_t packed = __nv_cvt_float2_to_fp8x2(
+                make_float2(values.x * inv_scale, values.y * inv_scale), __NV_SATFINITE, __NV_E4M3);
+            uint8_t * __restrict__ dst = yb->qs + frag_idx * 32 + 2 * lane;
+            if (i0 + 1 < ne0) {
+                *reinterpret_cast<__nv_fp8x2_storage_t *>(dst) = packed;
+            } else {
+                dst[0] = static_cast<uint8_t>(packed);
+            }
         }
     }
 #else
@@ -751,62 +741,51 @@ static __global__ void quantize_mmq_nvfp4_w4a8_glu(
     const float * __restrict__ gate_row = gate + i3 * gate_s03 + i2 * gate_s02 + i1 * gate_s01;
     const float * __restrict__ up_row   = up   + i3 * up_s03   + i2 * up_s02   + i1 * up_s01;
 
-    float row_scale = 1.0f;
-    __shared__ float scale_shared;
-    if constexpr (dynamic_scale) {
-        float amax = 0.0f;
-        for (int64_t i0 = threadIdx.x; i0 < ne00; i0 += blockDim.x) {
-            const float value = ggml_cuda_op_silu_single(gate_row[i0]) * up_row[i0];
-            amax = fmaxf(amax, fabsf(value));
+    GGML_UNUSED(scale_dynamic);
+    float inv_input_scale = 1.0f;
+    if constexpr (has_scale) {
+        const int64_t scale_idx = scale_activation_ne <= 1 ? 0 : i1;
+        float input_scale = scale_activation[scale_idx];
+        if (!(input_scale > 0.0f) || !isfinite(input_scale)) {
+            input_scale = 1.0f;
         }
-        amax = warp_reduce_max<WARP_SIZE>(amax);
-
-        __shared__ float warp_amax[CUDA_QUANTIZE_BLOCK_SIZE / WARP_SIZE];
-        const int lane = threadIdx.x % WARP_SIZE;
-        const int warp = threadIdx.x / WARP_SIZE;
-        if (lane == 0) {
-            warp_amax[warp] = amax;
-        }
-        __syncthreads();
-        if (warp == 0) {
-            amax = lane < CUDA_QUANTIZE_BLOCK_SIZE / WARP_SIZE ? warp_amax[lane] : 0.0f;
-            amax = warp_reduce_max<WARP_SIZE>(amax);
-            if (lane == 0) {
-                scale_shared = amax / 448.0f;
-                scale_dynamic[(int64_t) blockIdx.y * ne1 + i1] = scale_shared;
-            }
-        }
-        __syncthreads();
-        row_scale = scale_shared;
-    } else if constexpr (has_scale) {
-        if (threadIdx.x == 0) {
-            const int64_t scale_idx = scale_activation_ne <= 1 ? 0 : i1;
-            float input_scale = scale_activation[scale_idx];
-            if (!(input_scale > 0.0f) || !isfinite(input_scale)) {
-                input_scale = 1.0f;
-            }
-            scale_shared = 6.0f * input_scale;
-        }
-        __syncthreads();
-        row_scale = scale_shared;
+        inv_input_scale = 1.0f / input_scale;
     }
 
-    const float inv_scale = row_scale > 0.0f ? 1.0f / row_scale : 0.0f;
     const int64_t blocks_per_col = (ne0 + QK_K - 1) / QK_K;
     const int64_t batch_offset = (int64_t) blockIdx.y * blocks_per_col * ne1;
-    for (int64_t i0 = 2 * threadIdx.x; i0 < ne0; i0 += 2 * blockDim.x) {
-        const int64_t k_block = i0 / QK_K;
-        const int offset = i0 % QK_K;
-        const float2 values = make_float2(
-            i0     < ne00 ? ggml_cuda_op_silu_single(gate_row[i0])     * up_row[i0]     * inv_scale : 0.0f,
-            i0 + 1 < ne00 ? ggml_cuda_op_silu_single(gate_row[i0 + 1]) * up_row[i0 + 1] * inv_scale : 0.0f);
-        const __nv_fp8x2_storage_t packed = __nv_cvt_float2_to_fp8x2(
-            values, __NV_SATFINITE, __NV_E4M3);
-        uint8_t * __restrict__ dst = y[batch_offset + k_block * ne1 + i1].qs + offset;
-        if (i0 + 1 < ne0) {
-            *reinterpret_cast<__nv_fp8x2_storage_t *>(dst) = packed;
-        } else {
-            dst[0] = static_cast<uint8_t>(packed);
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int nwarps = blockDim.x / WARP_SIZE;
+    const int64_t nfrags = (ne0 + 31) / 32;
+    const int64_t frag_stride = (int64_t) gridDim.z * nwarps;
+    for (int64_t frag = (int64_t) blockIdx.z * nwarps + warp; frag < nfrags; frag += frag_stride) {
+        const int64_t i0 = 32 * frag + 2 * lane;
+        const float2 values = lane < 16 ? make_float2(
+            i0     < ne00 ? ggml_cuda_op_silu_single(gate_row[i0])     * up_row[i0]     * inv_input_scale : 0.0f,
+            i0 + 1 < ne00 ? ggml_cuda_op_silu_single(gate_row[i0 + 1]) * up_row[i0 + 1] * inv_input_scale : 0.0f) :
+            make_float2(0.0f, 0.0f);
+        const float amax = warp_reduce_max<WARP_SIZE>(fmaxf(fabsf(values.x), fabsf(values.y)));
+        uint32_t scale_code = lane == 0 ?
+            (uint32_t) __nv_cvt_float_to_e8m0(amax / 448.0f, __NV_SATFINITE, cudaRoundPosInf) : 0;
+        scale_code = __shfl_sync(0xFFFFFFFFu, scale_code, 0);
+        const float inv_scale = scale_code > 0 ? ldexpf(1.0f, 127 - (int) scale_code) : 0.0f;
+
+        const int64_t k_block = frag / 8;
+        const int frag_idx = frag % 8;
+        block_nvfp4_w4a8_mmq * __restrict__ yb = y + batch_offset + k_block * ne1 + i1;
+        if (lane == 0) {
+            reinterpret_cast<uint8_t *>(yb->sc8_u32)[frag_idx] = (uint8_t) scale_code;
+        }
+        if (lane < 16 && i0 < ne0) {
+            const __nv_fp8x2_storage_t packed = __nv_cvt_float2_to_fp8x2(
+                make_float2(values.x * inv_scale, values.y * inv_scale), __NV_SATFINITE, __NV_E4M3);
+            uint8_t * __restrict__ dst = yb->qs + frag_idx * 32 + 2 * lane;
+            if (i0 + 1 < ne0) {
+                *reinterpret_cast<__nv_fp8x2_storage_t *>(dst) = packed;
+            } else {
+                dst[0] = static_cast<uint8_t>(packed);
+            }
         }
     }
 #else
@@ -1464,8 +1443,11 @@ void quantize_mmq_nvfp4_w4a8_cuda(
     GGML_ASSERT(ne0 > 0);
     GGML_ASSERT(!scale_activation || !scale_dynamic);
 
-    const dim3 blocks(ne1, ne2 * ne3, 1);
     const dim3 threads(ne1 <= 8 ? 2 * CUDA_QUANTIZE_BLOCK_SIZE : CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    const int64_t nfrags = (ne0 + 31) / 32;
+    const int64_t nwarps = threads.x / WARP_SIZE;
+    const int64_t frag_blocks = ne1 <= 8 ? (nfrags + nwarps - 1) / nwarps : 1;
+    const dim3 blocks(ne1, ne2 * ne3, frag_blocks);
     if (scale_dynamic) {
         if (ids) {
             quantize_mmq_nvfp4_w4a8<true, false, true><<<blocks, threads, 0, stream>>>(
@@ -1486,6 +1468,10 @@ void quantize_mmq_nvfp4_w4a8_cuda(
                 x, nullptr, nullptr, (block_nvfp4_w4a8_mmq *) vy, scale_activation, nullptr, scale_activation_ne,
                 ne00, s01, s02, s03, ne0, ne1, ne2);
         }
+    } else if (ids) {
+        quantize_mmq_nvfp4_w4a8<true, false, false><<<blocks, threads, 0, stream>>>(
+            x, ids, ids_expert, (block_nvfp4_w4a8_mmq *) vy, nullptr, nullptr, 0,
+            ne00, s01, s02, s03, ne0, ne1, ne2);
     } else {
         quantize_mmq_nvfp4_w4a8<false, false, false><<<blocks, threads, 0, stream>>>(
             x, nullptr, nullptr, (block_nvfp4_w4a8_mmq *) vy, nullptr, nullptr, 0,
@@ -1505,8 +1491,11 @@ void quantize_mmq_nvfp4_w4a8_glu_cuda(
     GGML_ASSERT(ne0 > 0);
     GGML_ASSERT(!scale_activation || !scale_dynamic);
 
-    const dim3 blocks(ne1, ne2 * ne3, 1);
     const dim3 threads(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    const int64_t nfrags = (ne0 + 31) / 32;
+    const int64_t nwarps = threads.x / WARP_SIZE;
+    const int64_t frag_blocks = ne1 <= 8 ? (nfrags + nwarps - 1) / nwarps : 1;
+    const dim3 blocks(ne1, ne2 * ne3, frag_blocks);
     if (scale_dynamic) {
         quantize_mmq_nvfp4_w4a8_glu<false, true><<<blocks, threads, 0, stream>>>(
             gate, up, (block_nvfp4_w4a8_mmq *) vy, nullptr, scale_dynamic, 0, ne00,

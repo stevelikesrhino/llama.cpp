@@ -201,7 +201,7 @@ static void ggml_cuda_mul_mat_q_impl(
             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * y_block_size;
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
-        const bool use_dynamic_scale = use_native_nvfp4 && scale_x_q_d == nullptr;
+        const bool use_dynamic_scale = use_native_nvfp4 && !use_w4a8 && scale_x_q_d == nullptr;
         if (use_dynamic_scale) {
             src1_scale.alloc(ne13 * ne12 * ne11);
         }
@@ -321,7 +321,7 @@ static void ggml_cuda_mul_mat_q_impl(
         ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * y_block_size;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
-    const bool use_dynamic_scale = use_native_nvfp4 && scale_x_q_d == nullptr;
+    const bool use_dynamic_scale = use_native_nvfp4 && !use_w4a8 && scale_x_q_d == nullptr;
     if (use_dynamic_scale) {
         src1_scale.alloc(ne12 * n_expert_used);
     }

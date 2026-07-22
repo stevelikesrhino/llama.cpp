@@ -59,6 +59,7 @@ struct block_nvfp4_mmq {
 };
 
 struct block_nvfp4_w4a8_mmq {
+    uint32_t sc8_u32[2];  // 8 UE8M0 scales, one per 32-value subblock.
     uint8_t qs[QK_K];
 };
 
@@ -1001,8 +1002,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_process_nvfp4_direct(
         (const block_nvfp4_blackwell_tensor *) x;
     const float tensor_scale =
         (x_tensor->weight_scales ? x_tensor->weight_scales[scale_channel] : x_tensor->weight_scale) *
-        (x_tensor->input_scales  ? x_tensor->input_scales[scale_channel]  : x_tensor->input_scale) *
-        (w4a8 && y_scale == nullptr ? 6.0f : 1.0f);
+        (x_tensor->input_scales  ? x_tensor->input_scales[scale_channel]  : x_tensor->input_scale);
 
     const int k_block_start = kb0_start / blocks_per_tile;
     const int k_block_stop  = (kb0_stop + blocks_per_tile - 1) / blocks_per_tile;
