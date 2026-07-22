@@ -1495,7 +1495,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_nvfp4_w4a44_direct(
                             C1, A[n][frag], B1[frag], scale_a[n][frag], scale_b[frag]);
 #pragma unroll
                         for (int l = 0; l < tile_C::ne; ++l) {
-                            sum_n[l] += tensor_scale * (C0.x[l] + (1.0f / 12.0f) * C1.x[l]);
+                            sum_n[l] += tensor_scale * (C0.x[l] + (1.0f / 6.0f) * C1.x[l]);
                         }
                     }
                 }

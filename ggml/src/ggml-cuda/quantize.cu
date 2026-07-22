@@ -230,8 +230,8 @@ static __device__ __forceinline__ void ggml_cuda_nvfp4_quantize_4o6_residual(
     for (int k = 0; k < 8; ++k) {
         const float q0 = 0.5f * (float) kvalues_mxfp4[(plane0_0 >> (4 * k)) & 0x0Fu];
         const float q1 = 0.5f * (float) kvalues_mxfp4[(plane0_1 >> (4 * k)) & 0x0Fu];
-        residual0[k] = 12.0f * (vals0[k] / dequant_scale - q0);
-        residual1[k] = 12.0f * (vals1[k] / dequant_scale - q1);
+        residual0[k] = 6.0f * (vals0[k] / dequant_scale - q0);
+        residual1[k] = 6.0f * (vals1[k] / dequant_scale - q1);
     }
 
     float residual_err = 0.0f;

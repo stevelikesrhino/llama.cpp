@@ -66,7 +66,7 @@ struct block_nvfp4_w4a8_mmq {
 struct block_nvfp4_w4a44_mmq {
     uint32_t sc4_u32[4];   // 16 shared UE4M3 scales, one per 16-value subblock.
     uint32_t qs0_u32[32];  // Primary E2M1 plane.
-    uint32_t qs1_u32[32];  // 12x residual E2M1 plane.
+    uint32_t qs1_u32[32];  // 6x residual E2M1 plane.
 };
 
 static_assert(sizeof(block_q8_1_mmq) == QK8_1_MMQ + 4*sizeof(half2), "Unexpected block_q8_1_mmq size");
