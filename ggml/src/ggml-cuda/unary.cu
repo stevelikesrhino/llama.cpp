@@ -283,6 +283,21 @@ static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k,
     ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
 }
 
+void ggml_cuda_glu_f32(
+        const float * gate, const float * up, float * dst, const int64_t nelements,
+        const ggml_glu_op glu_op, cudaStream_t stream) {
+    switch (glu_op) {
+        case GGML_GLU_OP_SWIGLU:
+            unary_gated_cuda<op_silu>(gate, up, dst, nelements, nelements, nelements, nelements, stream);
+            break;
+        case GGML_GLU_OP_GEGLU:
+            unary_gated_cuda<op_gelu>(gate, up, dst, nelements, nelements, nelements, nelements, stream);
+            break;
+        default:
+            GGML_ABORT("unsupported GLU operation");
+    }
+}
+
 template <float (*op)(float)>
 void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];

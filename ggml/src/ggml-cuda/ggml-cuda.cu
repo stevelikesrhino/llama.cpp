@@ -4810,6 +4810,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
+#if defined(BLACKWELL_MMA_AVAILABLE)
+            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            const ggml_glu_op glu_op = ggml_get_glu_op(glu);
+            const bool use_nvfp4_tc_fusion = up->op == GGML_OP_MUL_MAT && up->src[0]->type == GGML_TYPE_NVFP4 &&
+                (glu_op == GGML_GLU_OP_SWIGLU || glu_op == GGML_GLU_OP_GEGLU) &&
+                (cuda_ctx->nvfp4_w4a8 || cuda_ctx->nvfp4_w4a44) &&
+                ggml_cuda_should_use_nvfp4_tc_mmvq(up->src[0]->type, cc, up->src[1]->ne[1]);
+            if (use_nvfp4_tc_fusion) {
+                ggml_cuda_mul_mat_nvfp4_tc_mmvq_glu(*cuda_ctx, up, gate, glu, glu_op);
+                fused_mul_mat_vec = true;
+                fused_node_count = 3;
+                break;
+            }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+
             if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];

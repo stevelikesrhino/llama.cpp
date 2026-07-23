@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "unary.cuh"
 
 static bool ggml_cuda_is_aligned_float8(
         const void * ptr, const size_t stride1, const size_t stride2, const size_t stride3) {
@@ -83,14 +84,52 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
 
 // Native Blackwell NVFP4 MMVQ reuses MMQ with mmq_x=8 to match the fixed N=8 MMA tile.
 static void ggml_cuda_mul_mat_q_launch(
-        ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const bool force_mmq_x_8_nvfp4) {
+        ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const bool force_mmq_x_8_nvfp4,
+        const mmq_args * fusion_args = nullptr) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
     if (force_mmq_x_8_nvfp4) {
         GGML_ASSERT(args.type_x == GGML_TYPE_NVFP4);
+        GGML_ASSERT(!fusion_args || !args.ids_dst);
         if (args.nrows_x % 128 == 0) {
-            launch_mul_mat_q<GGML_TYPE_NVFP4, 8, false>(ctx, args, stream);
+            if (args.w4a44) {
+                if (args.ids_dst) {
+                    launch_mul_mat_q<GGML_TYPE_NVFP4, 8, false, 2>(ctx, args, stream);
+                } else if (fusion_args) {
+                    launch_mul_mat_q<GGML_TYPE_NVFP4, 8, false, 2, true, true>(ctx, args, stream, fusion_args);
+                } else {
+                    launch_mul_mat_q<GGML_TYPE_NVFP4, 8, false, 2, true>(ctx, args, stream);
+                }
+            } else if (args.w4a8) {
+                if (args.ids_dst) {
+                    launch_mul_mat_q<GGML_TYPE_NVFP4, 8, false, 1>(ctx, args, stream);
+                } else if (fusion_args) {
+                    launch_mul_mat_q<GGML_TYPE_NVFP4, 8, false, 1, true, true>(ctx, args, stream, fusion_args);
+                } else {
+                    launch_mul_mat_q<GGML_TYPE_NVFP4, 8, false, 1, true>(ctx, args, stream);
+                }
+            } else {
+                launch_mul_mat_q<GGML_TYPE_NVFP4, 8, false>(ctx, args, stream);
+            }
         } else {
-            launch_mul_mat_q<GGML_TYPE_NVFP4, 8, true>(ctx, args, stream);
+            if (args.w4a44) {
+                if (args.ids_dst) {
+                    launch_mul_mat_q<GGML_TYPE_NVFP4, 8, true, 2>(ctx, args, stream);
+                } else if (fusion_args) {
+                    launch_mul_mat_q<GGML_TYPE_NVFP4, 8, true, 2, true, true>(ctx, args, stream, fusion_args);
+                } else {
+                    launch_mul_mat_q<GGML_TYPE_NVFP4, 8, true, 2, true>(ctx, args, stream);
+                }
+            } else if (args.w4a8) {
+                if (args.ids_dst) {
+                    launch_mul_mat_q<GGML_TYPE_NVFP4, 8, true, 1>(ctx, args, stream);
+                } else if (fusion_args) {
+                    launch_mul_mat_q<GGML_TYPE_NVFP4, 8, true, 1, true, true>(ctx, args, stream, fusion_args);
+                } else {
+                    launch_mul_mat_q<GGML_TYPE_NVFP4, 8, true, 1, true>(ctx, args, stream);
+                }
+            } else {
+                launch_mul_mat_q<GGML_TYPE_NVFP4, 8, true>(ctx, args, stream);
+            }
         }
         return;
     }
@@ -98,16 +137,23 @@ static void ggml_cuda_mul_mat_q_launch(
     GGML_ASSERT(!force_mmq_x_8_nvfp4);
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
+    GGML_ASSERT(!fusion_args);
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
 
 static void ggml_cuda_mul_mat_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const bool force_mmq_x_8_nvfp4, const bool fuse_src1_glu_nvfp4) {
+        const bool force_mmq_x_8_nvfp4, const bool fuse_src1_glu_nvfp4,
+        const ggml_tensor * fusion_gate = nullptr, ggml_tensor * fusion_dst = nullptr,
+        const ggml_glu_op fusion_glu_op = GGML_GLU_OP_SWIGLU) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
     GGML_ASSERT(!fuse_src1_glu_nvfp4 || (!ids && src0->type == GGML_TYPE_NVFP4 && ggml_cuda_can_quantize_nvfp4_glu(src1)));
+    GGML_ASSERT((fusion_gate == nullptr) == (fusion_dst == nullptr));
+    GGML_ASSERT(!fusion_gate || (!ids && force_mmq_x_8_nvfp4 && !fuse_src1_glu_nvfp4 &&
+        fusion_gate->op == GGML_OP_MUL_MAT && fusion_gate->src[1] == src1 &&
+        fusion_gate->src[0]->type == GGML_TYPE_NVFP4 && ggml_are_same_shape(fusion_gate, dst)));
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -126,6 +172,8 @@ static void ggml_cuda_mul_mat_q_impl(
 
     const char  * src0_d = (const char  *) src0->data;
     const float * src1_d = (const float *) src1->data;
+    const ggml_tensor * fusion_src0 = fusion_gate ? fusion_gate->src[0] : nullptr;
+    const char * fusion_src0_d = fusion_src0 ? (const char *) fusion_src0->data : nullptr;
     const ggml_tensor * scale_x_t = src0->type == GGML_TYPE_NVFP4 ? ggml_cuda_mul_mat_input_scale(dst) : nullptr;
     const float * scale_x_d = scale_x_t ? (const float *) scale_x_t->data : nullptr;
     const int64_t scale_x_ne = scale_x_t ? ggml_nelements(scale_x_t) : 0;
@@ -142,6 +190,25 @@ static void ggml_cuda_mul_mat_q_impl(
 #else
     const float * scale_x_q_d = scale_x_d;
     const int64_t scale_x_q_ne = scale_x_ne;
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+    const ggml_tensor * fusion_scale_x_t = fusion_gate ? ggml_cuda_mul_mat_input_scale(fusion_gate) : nullptr;
+    const float * fusion_scale_x_d = fusion_scale_x_t ? (const float *) fusion_scale_x_t->data : nullptr;
+    const int64_t fusion_scale_x_ne = fusion_scale_x_t ? ggml_nelements(fusion_scale_x_t) : 0;
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const ggml_tensor * fusion_scale_x_src = fusion_src0 ? fusion_src0->src[1] : nullptr;
+    float fusion_scale_x_header = 0.0f;
+    if (fusion_src0) {
+        memcpy(&fusion_scale_x_header, &fusion_src0->op_params[1], sizeof(fusion_scale_x_header));
+    }
+    const bool fusion_scale_x_in_header = fusion_src0 && use_nvfp4_layout &&
+        ((fusion_scale_x_src != nullptr && ggml_is_scalar(fusion_scale_x_src)) || fusion_scale_x_header > 0.0f);
+    const float * fusion_scale_x_q_d = fusion_scale_x_d != nullptr ? fusion_scale_x_d :
+        fusion_scale_x_in_header ? &((const block_nvfp4_blackwell_tensor *) fusion_src0_d)->input_scale : nullptr;
+    const int64_t fusion_scale_x_q_ne = fusion_scale_x_d != nullptr ? fusion_scale_x_ne :
+        fusion_scale_x_in_header ? 1 : 0;
+#else
+    const float * fusion_scale_x_q_d = fusion_scale_x_d;
+    const int64_t fusion_scale_x_q_ne = fusion_scale_x_ne;
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
     float       *  dst_d = (float       *)  dst->data;
 
@@ -201,9 +268,24 @@ static void ggml_cuda_mul_mat_q_impl(
             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * y_block_size;
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
+        ggml_cuda_pool_alloc<char> src1_q8_1_fusion(ctx.pool());
+        ggml_cuda_pool_alloc<float> src1_scale_fusion(ctx.pool());
+        bool share_fusion_quant = fusion_gate && scale_x_q_d == fusion_scale_x_q_d;
+#if defined(BLACKWELL_MMA_AVAILABLE)
+        share_fusion_quant = share_fusion_quant || (fusion_gate && scale_x_d == nullptr && fusion_scale_x_d == nullptr &&
+            scale_x_header > 0.0f && scale_x_header == fusion_scale_x_header);
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+        if (fusion_gate && !share_fusion_quant) {
+            GGML_ASSERT(use_native_nvfp4 && (use_w4a8 || use_w4a44));
+            src1_q8_1_fusion.alloc(nbytes_src1_q8_1);
+        }
         const bool use_dynamic_scale = use_native_nvfp4 && !use_w4a8 && scale_x_q_d == nullptr;
+        const bool use_dynamic_scale_fusion = fusion_gate && use_native_nvfp4 && !use_w4a8 && fusion_scale_x_q_d == nullptr;
         if (use_dynamic_scale) {
             src1_scale.alloc(ne13 * ne12 * ne11);
+        }
+        if (use_dynamic_scale_fusion && !share_fusion_quant) {
+            src1_scale_fusion.alloc(ne13 * ne12 * ne11);
         }
 
         {
@@ -267,6 +349,22 @@ static void ggml_cuda_mul_mat_q_impl(
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
+
+#if defined(BLACKWELL_MMA_AVAILABLE)
+            if (fusion_gate && !share_fusion_quant) {
+                if (use_w4a44) {
+                    quantize_mmq_nvfp4_w4a44_cuda(src1_d, nullptr, nullptr, src1_q8_1_fusion.get(), src0->type,
+                                                  ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13,
+                                                  fusion_scale_x_q_d, fusion_scale_x_q_ne, src1_scale_fusion.ptr, stream);
+                } else {
+                    GGML_ASSERT(use_w4a8);
+                    quantize_mmq_nvfp4_w4a8_cuda(src1_d, nullptr, nullptr, src1_q8_1_fusion.get(), src0->type,
+                                                 ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13,
+                                                 fusion_scale_x_q_d, fusion_scale_x_q_ne, src1_scale_fusion.ptr, stream);
+                }
+                CUDA_CHECK(cudaGetLastError());
+            }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
         }
 
         // Stride depends on quantization format
@@ -279,14 +377,40 @@ static void ggml_cuda_mul_mat_q_impl(
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
         const int64_t s13 = ne12*s12;
 
+        ggml_cuda_pool_alloc<float> fusion_up(ctx.pool());
+        ggml_cuda_pool_alloc<float> fusion_gate_out(ctx.pool());
+        float * mmq_dst = dst_d;
+        if (fusion_gate) {
+            const int64_t noutputs = ggml_nelements(dst);
+            fusion_up.alloc(noutputs);
+            fusion_gate_out.alloc(noutputs);
+            mmq_dst = fusion_up.ptr;
+        }
+
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, mmq_dst,
             src1_scale.ptr,
             ne00, ne01, ne1, s01_mmq, ne11, s1,
             ne02, ne12, s02_mmq, s12, s2,
             ne03, ne13, s03_mmq, s13, s3,
             use_stream_k, ne1, use_w4a8, use_w4a44};
-        ggml_cuda_mul_mat_q_launch(ctx, args, stream, force_mmq_x_8_nvfp4);
+        if (fusion_gate) {
+            const int * fusion_y = share_fusion_quant ? (const int *) src1_q8_1.ptr : (const int *) src1_q8_1_fusion.ptr;
+            const float * fusion_y_scale = share_fusion_quant ? src1_scale.ptr : src1_scale_fusion.ptr;
+            const mmq_args fusion_args = {
+                fusion_src0_d, src0->type, fusion_y, nullptr, nullptr, fusion_gate_out.ptr,
+                fusion_y_scale,
+                ne00, ne01, ne1, s01_mmq, ne11, s1,
+                ne02, ne12, s02_mmq, s12, s2,
+                ne03, ne13, s03_mmq, s13, s3,
+                use_stream_k, ne1, use_w4a8, use_w4a44};
+            ggml_cuda_mul_mat_q_launch(ctx, args, stream, force_mmq_x_8_nvfp4, &fusion_args);
+            ggml_cuda_glu_f32(
+                fusion_gate_out.ptr, fusion_up.ptr, (float *) fusion_dst->data,
+                ggml_nelements(fusion_dst), fusion_glu_op, stream);
+        } else {
+            ggml_cuda_mul_mat_q_launch(ctx, args, stream, force_mmq_x_8_nvfp4);
+        }
         return;
     }
 
@@ -413,6 +537,17 @@ void ggml_cuda_mul_mat_nvfp4_tc_mmvq(
     const int64_t ncols_dst = ids ? dst->ne[2] : src1->ne[1];
     GGML_ASSERT(ggml_cuda_should_use_nvfp4_tc_mmvq(src0->type, cc, ncols_dst));
     ggml_cuda_mul_mat_q_impl(ctx, src0, src1, ids, dst, true, false);
+}
+
+void ggml_cuda_mul_mat_nvfp4_tc_mmvq_glu(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate,
+        ggml_tensor * dst, const ggml_glu_op glu_op) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    GGML_ASSERT(up->op == GGML_OP_MUL_MAT && gate->op == GGML_OP_MUL_MAT);
+    GGML_ASSERT(up->src[1] == gate->src[1]);
+    GGML_ASSERT(ggml_cuda_should_use_nvfp4_tc_mmvq(up->src[0]->type, cc, up->src[1]->ne[1]));
+    GGML_ASSERT(glu_op == GGML_GLU_OP_SWIGLU || glu_op == GGML_GLU_OP_GEGLU);
+    ggml_cuda_mul_mat_q_impl(ctx, up->src[0], up->src[1], nullptr, (ggml_tensor *) up, true, false, gate, dst, glu_op);
 }
 
 void ggml_cuda_mul_mat_nvfp4_glu_q(
