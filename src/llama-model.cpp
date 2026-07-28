@@ -949,24 +949,31 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
 }
 
 // GPU: split if LLAMA_SPLIT_MODE_ROW -> GPU
-static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split) {
+static buft_list_t make_gpu_buft_list(
+        ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split, bool nvfp4_w4a8) {
     buft_list_t buft_list;
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const size_t dev_index = [&]() {
+        for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+            if (ggml_backend_reg_dev_get(reg, i) == dev) {
+                return i;
+            }
+        }
+        throw std::runtime_error(format("device %s not found in its backend reg", ggml_backend_dev_name(dev)));
+    }();
+    using ggml_backend_cuda_w4a8_buffer_type_t = ggml_backend_buffer_type_t (*)(int);
+    auto ggml_backend_cuda_w4a8_buffer_type_fn = (ggml_backend_cuda_w4a8_buffer_type_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_w4a8_buffer_type");
+
+    if (nvfp4_w4a8 && ggml_backend_cuda_w4a8_buffer_type_fn && split_mode == LLAMA_SPLIT_MODE_ROW) {
+        throw std::runtime_error("the CUDA NVFP4 W4A8 weight layout does not support row-split mode");
+    }
 
     // add the device split buffer type if requested and available
     if (split_mode == LLAMA_SPLIT_MODE_ROW) {
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         auto ggml_backend_split_buffer_type_fn = (ggml_backend_split_buffer_type_t)
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type");
         if (ggml_backend_split_buffer_type_fn) {
-            size_t dev_index = [&]() {
-                auto * reg = ggml_backend_dev_backend_reg(dev);
-                for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
-                    if (ggml_backend_reg_dev_get(reg, i) == dev) {
-                        return i;
-                    }
-                }
-                throw std::runtime_error(format("device %s not found in its backend reg", ggml_backend_dev_name(dev)));
-            }();
             auto * buft = ggml_backend_split_buffer_type_fn(dev_index, tensor_split);
             if (buft != nullptr) {
                 buft_list.emplace_back(dev, buft);
@@ -977,10 +984,13 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     }
 
     // add the device default buffer type
-    buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
+    ggml_backend_buffer_type_t default_buft = ggml_backend_dev_buffer_type(dev);
+    if (nvfp4_w4a8 && ggml_backend_cuda_w4a8_buffer_type_fn) {
+        default_buft = ggml_backend_cuda_w4a8_buffer_type_fn((int) dev_index);
+    }
+    buft_list.emplace_back(dev, default_buft);
 
     // add the device extra buffer type (if any)
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     if (reg) {
         auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
@@ -1265,7 +1275,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
     for (const auto & dev : devices) {
-        buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
+        buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split, params.nvfp4_w4a8);
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
@@ -2451,6 +2461,7 @@ llama_model_params llama_model_default_params() {
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
+        /*.nvfp4_w4a8                  =*/ false,
         /*.no_alloc                    =*/ false,
     };
 

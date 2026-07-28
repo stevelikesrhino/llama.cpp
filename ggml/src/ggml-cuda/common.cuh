@@ -1418,6 +1418,8 @@ struct ggml_cuda_stream_context {
     }
 };
 
+bool ggml_backend_cuda_buffer_type_is_w4a8(ggml_backend_buffer_type_t buft);
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;

@@ -487,7 +487,7 @@ static void ggml_cuda_nvfp4_scatter(
 }
 
 static void ggml_cuda_cpy_nvfp4_repacked(
-        const ggml_tensor * src, ggml_tensor * dst, cudaStream_t stream) {
+        const ggml_tensor * src, ggml_tensor * dst, cudaStream_t stream, bool w4a8) {
     const ggml_tensor * src_root = ggml_cuda_nvfp4_root(src);
     ggml_tensor * dst_root = ggml_cuda_nvfp4_root(dst);
     const bool dst_covers_root = ggml_cuda_nvfp4_covers_root(dst, dst_root);
@@ -515,14 +515,22 @@ static void ggml_cuda_cpy_nvfp4_repacked(
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    ggml_cuda_unpack_tensor_nvfp4(src_root, src_packed.data(), src_root_data.data());
+    if (w4a8) {
+        ggml_cuda_unpack_tensor_nvfp4_w4a8(src_root, src_packed.data(), src_root_data.data());
+    } else {
+        ggml_cuda_unpack_tensor_nvfp4(src_root, src_packed.data(), src_root_data.data());
+    }
     ggml_cuda_nvfp4_gather(src, src_root, src_root_data.data(), copied.data());
 
     if (dst_root == src_root) {
         dst_root_data = src_root_data;
         dst_packed = src_packed;
     } else if (!dst_covers_root) {
-        ggml_cuda_unpack_tensor_nvfp4(dst_root, dst_packed.data(), dst_root_data.data());
+        if (w4a8) {
+            ggml_cuda_unpack_tensor_nvfp4_w4a8(dst_root, dst_packed.data(), dst_root_data.data());
+        } else {
+            ggml_cuda_unpack_tensor_nvfp4(dst_root, dst_packed.data(), dst_root_data.data());
+        }
     }
     ggml_cuda_nvfp4_scatter(dst, dst_root, copied.data(), dst_root_data.data());
 
@@ -532,7 +540,11 @@ static void ggml_cuda_cpy_nvfp4_repacked(
     } else {
         memcpy(header.data(), dst_packed.data(), header.size());
     }
-    ggml_cuda_repack_tensor_nvfp4(dst_root, dst_root_data.data(), dst_packed.data());
+    if (w4a8) {
+        ggml_cuda_repack_tensor_nvfp4_w4a8(dst_root, dst_root_data.data(), dst_packed.data());
+    } else {
+        ggml_cuda_repack_tensor_nvfp4(dst_root, dst_root_data.data(), dst_packed.data());
+    }
     memcpy(dst_packed.data(), header.data(), header.size());
 
     CUDA_CHECK(cudaMemcpyAsync(
@@ -588,7 +600,7 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
             GGML_ASSERT(copy_size == ggml_cuda_nvfp4_tensor_alloc_size(src1_root));
             CUDA_CHECK(cudaMemcpyAsync(src1_root->data, src0_root->data, copy_size, cudaMemcpyDeviceToDevice, main_stream));
         } else {
-            ggml_cuda_cpy_nvfp4_repacked(src0, src1, main_stream);
+            ggml_cuda_cpy_nvfp4_repacked(src0, src1, main_stream, ctx.nvfp4_w4a8);
         }
         return;
     }

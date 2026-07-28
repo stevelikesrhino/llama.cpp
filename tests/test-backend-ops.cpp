@@ -1315,6 +1315,7 @@ struct test_case {
 
     test_status_t eval(ggml_backend_t backend1,
                        ggml_backend_t backend2,
+                       ggml_backend_buffer_type_t buft,
                        const char *   op_names_filter,
                        printer *      output_printer) {
         mode = MODE_TEST;
@@ -1377,7 +1378,7 @@ struct test_case {
 
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights) {
-            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend1));
+            buf_weights.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_weights.get(), buft));
             if (buf_weights == NULL) {
                 printf("failed to allocate weight tensors [%s] ", ggml_backend_name(backend1));
                 return test_status_t::FAIL;
@@ -1386,7 +1387,7 @@ struct test_case {
         }
 
         // allocate
-        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend1));
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
 
         if (buf == NULL) {
             printf("failed to allocate tensors [%s] ", ggml_backend_name(backend1));
@@ -1501,7 +1502,9 @@ struct test_case {
         return test_passed ? test_status_t::OK : test_status_t::FAIL;
     }
 
-    bool eval_perf(ggml_backend_t backend, const char * op_names_filter, printer * output_printer) {
+    bool eval_perf(
+            ggml_backend_t backend, ggml_backend_buffer_type_t buft,
+            const char * op_names_filter, printer * output_printer) {
         mode = MODE_PERF;
 
         static const size_t graph_nodes = 8192;
@@ -1537,7 +1540,7 @@ struct test_case {
 
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights) {
-            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend));
+            buf_weights.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_weights.get(), buft));
             if (buf_weights == NULL) {
                 printf("failed to allocate weight tensors\n");
                 return false;
@@ -1546,7 +1549,7 @@ struct test_case {
         }
 
         // allocate
-        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend)); // smart ptr
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft)); // smart ptr
 
         if (buf == NULL) {
             printf("failed to allocate tensors\n");
@@ -10407,6 +10410,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_from_file(const c
     return test_cases;
 }
 
+static ggml_backend_buffer_type_t get_test_buffer_type(
+        ggml_backend_t backend, const char * backend_params) {
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+    if (backend_params == nullptr || strcmp(backend_params, "nvfp4_w4a8=1") != 0) {
+        return buft;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    using ggml_backend_cuda_w4a8_buffer_type_t = ggml_backend_buffer_type_t (*)(int);
+    auto w4a8_buffer_type = (ggml_backend_cuda_w4a8_buffer_type_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_w4a8_buffer_type");
+    GGML_ASSERT(w4a8_buffer_type);
+
+    size_t dev_index = 0;
+    while (dev_index < ggml_backend_reg_dev_count(reg) &&
+            ggml_backend_reg_dev_get(reg, dev_index) != dev) {
+        ++dev_index;
+    }
+    GGML_ASSERT(dev_index < ggml_backend_reg_dev_count(reg));
+
+    buft = w4a8_buffer_type((int) dev_index);
+    GGML_ASSERT(buft);
+    return buft;
+}
+
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
                          printer * output_printer, const char * test_file_path, int parallel_workers, const char * backend_params) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
@@ -10427,6 +10456,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
     };
 
     std::vector<std::unique_ptr<test_case>> test_cases;
+    ggml_backend_buffer_type_t test_buft = get_test_buffer_type(backend, backend_params);
 
     if (test_file_path == nullptr) {
         switch (mode) {
@@ -10486,7 +10516,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             while (my_begin < test_cases.size()) {
                 for (size_t i = my_begin; i < my_end; ++i) {
                     auto & test = test_cases[i];
-                    test_status_t status = test->eval(b, b_cpu, op_names_filter, output_printer);
+                    test_status_t status = test->eval(b, b_cpu, test_buft, op_names_filter, output_printer);
                     if (status == test_status_t::SKIPPED || status == test_status_t::NOT_SUPPORTED) {
                         continue;
                     }
@@ -10568,7 +10598,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
     if (mode == MODE_PERF) {
         for (auto & test : test_cases) {
-            test->eval_perf(backend, op_names_filter, output_printer);
+            test->eval_perf(backend, test_buft, op_names_filter, output_printer);
         }
         return true;
     }
