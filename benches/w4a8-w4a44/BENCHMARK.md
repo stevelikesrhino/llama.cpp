@@ -1,6 +1,6 @@
 # NVFP4 Activation Quantization Benchmark
 
-Date: 2026-07-23  
+Date: 2026-07-23 (original); 2026-07-29 (W4A8 TMA speed)<br>
 GPU: NVIDIA GeForce RTX 5090, 32 GB  
 Driver: 610.62
 
@@ -11,8 +11,9 @@ Driver: 610.62
 | Master | `F:\llama-cpp\Release` | `4310aa4f8` (10101) | None |
 | W4A44 | `F:\llama-cpp\alpha` | `bb43b5038` (10118) | `--nvfp4-w4a44` |
 | W4A8 | `F:\llama-cpp\alpha` | `bb43b5038` (10118) | `--nvfp4-w4a8` |
+| W4A8 TMA | `F:\llama-cpp\alpha` | `6a399fd36` (10192) | `--nvfp4-w4a8` |
 
-Master is the unquantized-activation reference path for this comparison. W4A44 and W4A8 use the latest merged alpha binaries.
+Master is the unquantized-activation reference path for this comparison. W4A44 and W4A8 use the merged alpha binaries available for the original measurements. W4A8 TMA uses the current alpha binaries.
 
 ## Models and settings
 
@@ -23,7 +24,7 @@ Each KLD/speed pair uses the same model file.
 | Gemma 4 31B | `gemma4-31B-it-Q6_K_RSF-nvfp4-amax.gguf` | `bartowski-calibration.txt` / `gemma4-31B-it-bf16.gguf.kld` |
 | Qwen 3.6 27B | `qwen3.6-27B-nvfp4-amax-mtp-dynamic.gguf` | `wiki.train.raw` / `qwen3.6-bf16.gguf.kld` |
 
-KLD used 120 chunks, context 2048, batch 2048, ubatch 512, flash attention on, and full GPU offload. Speed used five measured repetitions, FP16 KV cache, flash attention on, ubatch 1024, PP8192, and TG256. Gemma speed used batch 4096; Qwen speed used batch 8192.
+KLD used 120 chunks, context 2048, batch 2048, ubatch 512, flash attention on, and full GPU offload. Speed used five measured repetitions, FP16 KV cache, flash attention on, ubatch 1024, PP8192, and TG256. Gemma speed used batch 4096; Qwen speed used batch 8192. W4A8 TMA is byte-exact with W4A8, so its KLD/PPL entries reuse the existing W4A8 results; only speed was rerun.
 
 ## KLD and PPL
 
@@ -36,9 +37,11 @@ Lower is better for PPL ratio distance from 1.0, KLD, and RMS Δp. Higher is bet
 | Gemma | Master | 1412.920184 | 1.561780 | 0.814149 | 38.269611 | 22.990194 | 12.653790 | 15.898% | 77.545% |
 | Gemma | W4A44 | 1503.217813 | 1.661591 | 0.614236 | 37.540241 | 21.954350 | 10.881876 | 13.835% | 80.869% |
 | Gemma | W4A8 | 1423.859926 | 1.573872 | 0.656019 | 37.708397 | 22.221085 | 11.197418 | 14.337% | 80.155% |
+| Gemma | W4A8 TMA | 1423.859926 | 1.573872 | 0.656019 | 37.708397 | 22.221085 | 11.197418 | 14.337% | 80.155% |
 | Qwen | Master | 6.426297 | 1.005461 | 0.061668 | 30.135740 | 12.771930 | 0.607675 | 6.384% | 93.233% |
 | Qwen | W4A44 | 6.388694 | 0.999578 | 0.037500 | 30.319977 | 8.705987 | 0.287214 | 4.794% | 95.088% |
 | Qwen | W4A8 | 6.391456 | 1.000010 | 0.043650 | 30.070417 | 9.922916 | 0.350049 | 5.205% | 94.647% |
+| Qwen | W4A8 TMA | 6.391456 | 1.000010 | 0.043650 | 30.070417 | 9.922916 | 0.350049 | 5.205% | 94.647% |
 
 ### Change relative to master
 
@@ -48,8 +51,10 @@ Negative KLD and RMS changes are improvements. PPL changes are directional and m
 |---|---|---:|---:|---:|---:|---:|---:|---:|
 | Gemma | W4A44 | +6.39% | **-24.55%** | **-1.91%** | **-4.51%** | **-14.00%** | **-12.98%** | **+4.29%** |
 | Gemma | W4A8 | +0.77% | -19.42% | -1.47% | -3.35% | -11.51% | -9.82% | +3.37% |
+| Gemma | W4A8 TMA | +0.77% | -19.42% | -1.47% | -3.35% | -11.51% | -9.82% | +3.37% |
 | Qwen | W4A44 | -0.59% | **-39.19%** | +0.61% | **-31.83%** | **-52.74%** | **-24.91%** | **+1.99%** |
 | Qwen | W4A8 | -0.54% | -29.22% | **-0.22%** | -22.31% | -42.40% | -18.47% | +1.52% |
+| Qwen | W4A8 TMA | -0.54% | -29.22% | **-0.22%** | -22.31% | -42.40% | -18.47% | +1.52% |
 
 ### Additional KLD tail
 
@@ -58,9 +63,11 @@ Negative KLD and RMS changes are improvements. PPL changes are directional and m
 | Gemma | Master | 4.636336 | — | 2.006351 | — |
 | Gemma | W4A44 | 3.390528 | **-26.87%** | 1.306113 | **-34.90%** |
 | Gemma | W4A8 | 3.687301 | -20.47% | 1.441310 | -28.16% |
+| Gemma | W4A8 TMA | 3.687301 | -20.47% | 1.441310 | -28.16% |
 | Qwen | Master | 0.106876 | — | 0.053060 | — |
 | Qwen | W4A44 | 0.051899 | **-51.44%** | 0.025631 | **-51.69%** |
 | Qwen | W4A8 | 0.062307 | -41.70% | 0.030336 | -42.83% |
+| Qwen | W4A8 TMA | 0.062307 | -41.70% | 0.030336 | -42.83% |
 
 ## PP8192 and TG256 speed
 
@@ -73,22 +80,26 @@ Throughput is tokens per second. Values are the mean and standard deviation over
 | Gemma | Master | 4536.67 ± 14.86 | 68.74 ± 0.06 |
 | Gemma | W4A44 | 4090.89 ± 13.27 | 65.46 ± 0.08 |
 | Gemma | W4A8 | 3598.59 ± 12.69 | 65.74 ± 0.06 |
+| Gemma | W4A8 TMA | 4017.31 ± 12.04 | 66.67 ± 0.05 |
 | Qwen | Master | 4982.34 ± 12.76 | 69.27 ± 0.06 |
 | Qwen | W4A44 | 4587.03 ± 13.91 | 65.86 ± 0.07 |
 | Qwen | W4A8 | 4129.00 ± 12.66 | 66.39 ± 0.04 |
+| Qwen | W4A8 TMA | 4523.86 ± 11.51 | 67.02 ± 0.07 |
 
 ### Change relative to master
 
 | Model | Configuration | PP8192 Δ | TG256 Δ |
 |---|---|---:|---:|
 | Gemma | W4A44 | **-9.83%** | -4.77% |
-| Gemma | W4A8 | -20.68% | **-4.36%** |
+| Gemma | W4A8 | -20.68% | -4.36% |
+| Gemma | W4A8 TMA | -11.45% | **-3.01%** |
 | Qwen | W4A44 | **-7.93%** | -4.92% |
-| Qwen | W4A8 | -17.13% | **-4.16%** |
+| Qwen | W4A8 | -17.13% | -4.16% |
+| Qwen | W4A8 TMA | -9.20% | **-3.25%** |
 
 ## Reproduction commands
 
-Run the master commands from `F:\llama-cpp\Release`. Run W4A44/W4A8 from `F:\llama-cpp\alpha` and append the corresponding activation flag.
+Run the master commands from `F:\llama-cpp\Release`. Run W4A44, W4A8, and W4A8 TMA from `F:\llama-cpp\alpha` and append the corresponding activation flag.
 
 ### Gemma KLD
 
@@ -120,3 +131,5 @@ For alpha runs, append exactly one of:
 --nvfp4-w4a44
 --nvfp4-w4a8
 ```
+
+W4A8 TMA uses `--nvfp4-w4a8`; the TMA load path is built into build `6a399fd36` (10192) and does not require another flag.
