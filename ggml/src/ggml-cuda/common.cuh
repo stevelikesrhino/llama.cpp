@@ -1174,6 +1174,9 @@ struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
+    virtual void * alloc_single_mapping(size_t size, size_t * actual_size) {
+        return alloc(size, actual_size);
+    }
     virtual void free(void * ptr, size_t size) = 0;
 };
 
@@ -1203,6 +1206,13 @@ struct ggml_cuda_pool_alloc {
         GGML_ASSERT(pool != nullptr);
         GGML_ASSERT(ptr == nullptr);
         ptr = (T *) pool->alloc(size * sizeof(T), &this->actual_size);
+        return ptr;
+    }
+
+    T * alloc_single_mapping(size_t size) {
+        GGML_ASSERT(pool != nullptr);
+        GGML_ASSERT(ptr == nullptr);
+        ptr = (T *) pool->alloc_single_mapping(size * sizeof(T), &this->actual_size);
         return ptr;
     }
 

@@ -676,6 +676,7 @@ static __global__ void quantize_mmq_nvfp4_w4a8(
 
     const int64_t blocks_per_col = (ne0 + QK_K - 1) / QK_K;
     const int64_t batch_offset = (int64_t) blockIdx.y * blocks_per_col * ne1;
+    const int64_t scale_stride = ggml_cuda_w4a8_scale_stride(ne1);
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
     const int nwarps = blockDim.x / WARP_SIZE;
@@ -694,14 +695,18 @@ static __global__ void quantize_mmq_nvfp4_w4a8(
 
         const int64_t k_block = frag / 8;
         const int frag_idx = frag % 8;
-        block_nvfp4_w4a8_mmq * __restrict__ yb = y + batch_offset + k_block * ne1 + i1;
+        uint8_t * __restrict__ yb = reinterpret_cast<uint8_t *>(y + batch_offset + k_block * ne1);
         if (lane == 0) {
-            reinterpret_cast<uint8_t *>(yb->sc8_u32)[frag_idx] = (uint8_t) scale_code;
+            yb[256 * ne1 + (int64_t) frag_idx * scale_stride + i1] = (uint8_t) scale_code;
         }
         if (lane < 16 && i0 < ne0) {
             const __nv_fp8x2_storage_t packed = __nv_cvt_float2_to_fp8x2(
                 make_float2(values.x * inv_scale, values.y * inv_scale), __NV_SATFINITE, __NV_E4M3);
-            uint8_t * __restrict__ dst = yb->qs + frag_idx * 32 + 2 * lane;
+            const int plane = lane >> 3;
+            const int lane_in_plane = lane & 7;
+            uint8_t * __restrict__ dst =
+                yb + plane * 128 * ne1 + (int64_t) frag_idx * 16 * ne1 +
+                16 * i1 + 2 * lane_in_plane;
             if (i0 + 1 < ne0) {
                 *reinterpret_cast<__nv_fp8x2_storage_t *>(dst) = packed;
             } else {
@@ -754,6 +759,7 @@ static __global__ void quantize_mmq_nvfp4_w4a8_glu(
 
     const int64_t blocks_per_col = (ne0 + QK_K - 1) / QK_K;
     const int64_t batch_offset = (int64_t) blockIdx.y * blocks_per_col * ne1;
+    const int64_t scale_stride = ggml_cuda_w4a8_scale_stride(ne1);
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
     const int nwarps = blockDim.x / WARP_SIZE;
@@ -773,14 +779,18 @@ static __global__ void quantize_mmq_nvfp4_w4a8_glu(
 
         const int64_t k_block = frag / 8;
         const int frag_idx = frag % 8;
-        block_nvfp4_w4a8_mmq * __restrict__ yb = y + batch_offset + k_block * ne1 + i1;
+        uint8_t * __restrict__ yb = reinterpret_cast<uint8_t *>(y + batch_offset + k_block * ne1);
         if (lane == 0) {
-            reinterpret_cast<uint8_t *>(yb->sc8_u32)[frag_idx] = (uint8_t) scale_code;
+            yb[256 * ne1 + (int64_t) frag_idx * scale_stride + i1] = (uint8_t) scale_code;
         }
         if (lane < 16 && i0 < ne0) {
             const __nv_fp8x2_storage_t packed = __nv_cvt_float2_to_fp8x2(
                 make_float2(values.x * inv_scale, values.y * inv_scale), __NV_SATFINITE, __NV_E4M3);
-            uint8_t * __restrict__ dst = yb->qs + frag_idx * 32 + 2 * lane;
+            const int plane = lane >> 3;
+            const int lane_in_plane = lane & 7;
+            uint8_t * __restrict__ dst =
+                yb + plane * 128 * ne1 + (int64_t) frag_idx * 16 * ne1 +
+                16 * i1 + 2 * lane_in_plane;
             if (i0 + 1 < ne0) {
                 *reinterpret_cast<__nv_fp8x2_storage_t *>(dst) = packed;
             } else {

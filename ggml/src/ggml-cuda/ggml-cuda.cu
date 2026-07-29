@@ -542,9 +542,13 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     size_t pool_used = 0;
     size_t pool_size = 0;
     size_t granularity;
-#if defined(GGML_USE_HIP)
     std::vector<std::pair<CUdeviceptr, size_t>> mappings;
-#endif
+    struct allocation {
+        void * ptr;
+        size_t size;
+        size_t previous_pool_used;
+    };
+    std::vector<allocation> allocations;
 
     explicit ggml_cuda_pool_vmm(int device) :
         device(device),
@@ -566,10 +570,29 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         }
     }
 
-    void * alloc(size_t size, size_t * actual_size) override {
+    void * alloc_impl(size_t size, size_t * actual_size, bool single_mapping) {
         // round up the allocation size to the alignment to ensure that all allocations are aligned for all data types
         const size_t alignment = 128;
         size = alignment * ((size + alignment - 1) / alignment);
+
+        const size_t previous_pool_used = pool_used;
+        if (single_mapping) {
+            bool found = false;
+            for (const std::pair<CUdeviceptr, size_t> & mapping : mappings) {
+                const size_t mapping_start =
+                    static_cast<size_t>((uintptr_t) mapping.first - (uintptr_t) pool_addr);
+                const size_t mapping_end = mapping_start + mapping.second;
+                const size_t candidate = std::max(pool_used, mapping_start);
+                if (candidate <= mapping_end && size <= mapping_end - candidate) {
+                    pool_used = candidate;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                pool_used = pool_size;
+            }
+        }
 
         size_t avail = pool_size - pool_used;
 
@@ -596,9 +619,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // map at the end of the pool
             CUdeviceptr start_ptr = (CUdeviceptr)((char *)(pool_addr) + pool_size);
             CU_CHECK(cuMemMap(start_ptr, reserve_size, 0, handle, 0));
-#if defined(GGML_USE_HIP)
             mappings.push_back({start_ptr, reserve_size});
-#endif
 
             // the memory allocation handle is no longer needed after mapping
             CU_CHECK(cuMemRelease(handle));
@@ -661,6 +682,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         void * ptr = (void *) ((CUdeviceptr)((char *)(pool_addr) + pool_used));
         *actual_size = size;
         pool_used += size;
+        allocations.push_back({ptr, size, previous_pool_used});
 
 #ifdef DEBUG_CUDA_MALLOC
         printf("cuda pool[%d]: allocated %llu bytes at %llx\n", device, (unsigned long long) size, ptr);
@@ -669,15 +691,25 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         return ptr;
     }
 
+    void * alloc(size_t size, size_t * actual_size) override {
+        return alloc_impl(size, actual_size, false);
+    }
+
+    void * alloc_single_mapping(size_t size, size_t * actual_size) override {
+        return alloc_impl(size, actual_size, true);
+    }
+
     void free(void * ptr, size_t size) override {
 #ifdef DEBUG_CUDA_MALLOC
         printf("cuda pool[%d]: freed %llu bytes at %llx\n", device, (unsigned long long) size, ptr);
 #endif
 
-        pool_used -= size;
-
         // all deallocations must be in reverse order of the allocations
-        GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
+        GGML_ASSERT(!allocations.empty());
+        const allocation & last = allocations.back();
+        GGML_ASSERT(ptr == last.ptr && size == last.size);
+        pool_used = last.previous_pool_used;
+        allocations.pop_back();
     }
 };
 #endif // defined(GGML_USE_VMM)

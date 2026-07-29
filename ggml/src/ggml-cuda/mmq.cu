@@ -287,7 +287,12 @@ static void ggml_cuda_mul_mat_q_impl(
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * y_block_size;
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+        if (use_w4a8) {
+            src1_q8_1.alloc_single_mapping(nbytes_src1_q8_1);
+        } else {
+            src1_q8_1.alloc(nbytes_src1_q8_1);
+        }
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         ggml_cuda_pool_alloc<char> src1_q8_1_fusion(ctx.pool());
         ggml_cuda_pool_alloc<float> src1_scale_fusion(ctx.pool());
@@ -298,7 +303,11 @@ static void ggml_cuda_mul_mat_q_impl(
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
         if (fusion_gate && !share_fusion_quant) {
             GGML_ASSERT(use_native_nvfp4 && (use_w4a8 || use_w4a44));
-            src1_q8_1_fusion.alloc(nbytes_src1_q8_1);
+            if (use_w4a8) {
+                src1_q8_1_fusion.alloc_single_mapping(nbytes_src1_q8_1);
+            } else {
+                src1_q8_1_fusion.alloc(nbytes_src1_q8_1);
+            }
         }
         const bool use_dynamic_scale = use_native_nvfp4 && !use_w4a8 && scale_x_q_d == nullptr;
         const bool use_dynamic_scale_fusion = fusion_gate && use_native_nvfp4 && !use_w4a8 && fusion_scale_x_q_d == nullptr;
@@ -464,7 +473,12 @@ static void ggml_cuda_mul_mat_q_impl(
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
         ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * y_block_size;
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    if (use_w4a8) {
+        src1_q8_1.alloc_single_mapping(nbytes_src1_q8_1);
+    } else {
+        src1_q8_1.alloc(nbytes_src1_q8_1);
+    }
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     const bool use_dynamic_scale = use_native_nvfp4 && !use_w4a8 && scale_x_q_d == nullptr;
     if (use_dynamic_scale) {

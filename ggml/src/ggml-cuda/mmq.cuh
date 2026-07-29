@@ -10,6 +10,33 @@
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
 
+#if defined(BLACKWELL_MMA_AVAILABLE)
+static constexpr int    GGML_CUDA_W4A8_TMA_STAGES      = 2;
+static constexpr int    GGML_CUDA_W4A8_TMA_ROW_TILES   = 8;
+static constexpr int    GGML_CUDA_W4A8_B_STAGES        = 2;
+static constexpr int    GGML_CUDA_W4A8_B_WORDS_PER_COL = 8;
+
+template <int J>
+struct alignas(16) ggml_cuda_w4a8_b_fragment_cache {
+    static_assert(J >= 8 && J % 8 == 0, "W4A8 B cache width must be a positive multiple of 8");
+    uint32_t qs[J * GGML_CUDA_W4A8_B_WORDS_PER_COL];
+    uint8_t  scales[J];
+};
+
+static constexpr size_t GGML_CUDA_W4A8_TMA_STAGE_BYTES =
+    GGML_CUDA_W4A8_TMA_ROW_TILES * sizeof(block_nvfp4_blackwell_w4a8);
+static constexpr size_t GGML_CUDA_W4A8_TMA_BYTES =
+    GGML_CUDA_W4A8_TMA_STAGES * GGML_CUDA_W4A8_TMA_STAGE_BYTES +
+    2 * GGML_CUDA_W4A8_TMA_STAGES * sizeof(uint64_t);
+
+template <int J>
+static constexpr size_t ggml_cuda_w4a8_shared_bytes() {
+    return GGML_CUDA_W4A8_TMA_BYTES +
+        GGML_CUDA_W4A8_B_STAGES * sizeof(ggml_cuda_w4a8_b_fragment_cache<J>) +
+        2 * GGML_CUDA_W4A8_B_STAGES * sizeof(uint64_t);
+}
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+
 typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
 typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
 typedef void (*ggml_cuda_mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
@@ -58,10 +85,19 @@ struct block_nvfp4_mmq {
     uint32_t qs_u32[32];  // 256 E2M1 values packed as 4-bit pairs.
 };
 
-struct block_nvfp4_w4a8_mmq {
-    uint32_t sc8_u32[2];  // 8 UE8M0 scales, one per 32-value subblock.
-    uint8_t qs[QK_K];
+struct alignas(16) block_nvfp4_w4a8_mmq {
+    // Allocation unit only. The temporary buffer is arranged fragment-major:
+    // all low E4M3 planes, all high E4M3 planes, then all UE8M0 scale rows.
+    uint8_t data[QK_K + 8];
 };
+static_assert(alignof(block_nvfp4_w4a8_mmq) == 16, "W4A8 temporary blocks must be 16B aligned");
+static_assert(sizeof(block_nvfp4_w4a8_mmq) % 16 == 0, "W4A8 temporary block stride must be 16B aligned");
+static_assert(sizeof(block_nvfp4_w4a8_mmq) == QK_K + 16, "W4A8 temporary blocks must have 16B of scale padding");
+
+// The tail padding can hold eight scale rows padded to 16 columns when ncols >= 8.
+static constexpr __host__ __device__ int64_t ggml_cuda_w4a8_scale_stride(const int64_t ncols) {
+    return ncols >= 8 ? (ncols + 15) & ~int64_t(15) : ncols;
+}
 
 struct block_nvfp4_w4a44_mmq {
     uint32_t sc4_u32[4];   // 16 shared UE4M3 scales, one per 16-value subblock.
@@ -979,6 +1015,234 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 }
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
+static __device__ __forceinline__ void ggml_cuda_w4a8_tma_barrier_init(
+        uint64_t * barrier, const uint32_t arrive_count) {
+    const uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
+                 :
+                 : "r"(barrier_addr), "r"(arrive_count)
+                 : "memory");
+}
+
+static __device__ __forceinline__ void ggml_cuda_w4a8_tma_barrier_arrive_expect_tx(
+        uint64_t * barrier, const uint32_t transaction_bytes) {
+    const uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
+                 :
+                 : "r"(barrier_addr), "r"(transaction_bytes)
+                 : "memory");
+}
+
+static __device__ __forceinline__ void ggml_cuda_w4a8_tma_barrier_arrive(uint64_t * barrier) {
+    const uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];"
+                 :
+                 : "r"(barrier_addr)
+                 : "memory");
+}
+
+static __device__ __forceinline__ void ggml_cuda_w4a8_tma_barrier_wait(
+        uint64_t * barrier, const uint32_t phase) {
+    const uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "w4a8_tma_wait:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1, %2;\n\t"
+        "@p bra w4a8_tma_done;\n\t"
+        "bra w4a8_tma_wait;\n\t"
+        "w4a8_tma_done:\n\t"
+        "}"
+        :
+        : "r"(barrier_addr), "r"(phase), "r"(0x989680)
+        : "memory");
+}
+
+static __device__ __forceinline__ void ggml_cuda_w4a8_tma_load(
+        void * dst, const void * src, const uint32_t num_bytes, uint64_t * barrier) {
+    const uint32_t dst_addr     = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+    const uint32_t barrier_addr = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile(
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
+        "[%0], [%1], %2, [%3];"
+        :
+        : "r"(dst_addr), "l"(reinterpret_cast<uint64_t>(src)), "r"(num_bytes), "r"(barrier_addr)
+        : "memory");
+}
+
+static __device__ __forceinline__ void ggml_cuda_w4a8_tma_issue_stage(
+        block_nvfp4_blackwell_w4a8 * stage,
+        const block_nvfp4_blackwell_w4a8 * x_blocks,
+        const int stride_row_x,
+        uint64_t * barrier) {
+    ggml_cuda_w4a8_tma_barrier_arrive_expect_tx(barrier, GGML_CUDA_W4A8_TMA_STAGE_BYTES);
+#pragma unroll
+    for (int row_tile = 0; row_tile < GGML_CUDA_W4A8_TMA_ROW_TILES; ++row_tile) {
+        ggml_cuda_w4a8_tma_load(
+            stage + row_tile,
+            x_blocks + row_tile * stride_row_x,
+            sizeof(block_nvfp4_blackwell_w4a8),
+            barrier);
+    }
+}
+
+template <int J>
+static __device__ __forceinline__ void ggml_cuda_w4a8_issue_b_fragment(
+        ggml_cuda_w4a8_b_fragment_cache<J> * cache,
+        const block_nvfp4_w4a8_mmq * y,
+        const int ncols_y,
+        const int col_start,
+        const int frag_idx,
+        uint64_t * ready_barrier) {
+    constexpr uint32_t plane_bytes = J * 16;
+    constexpr uint32_t scale_bytes = J;
+    const uint8_t * y_bytes = reinterpret_cast<const uint8_t *>(y);
+    const int64_t scale_stride = ggml_cuda_w4a8_scale_stride(ncols_y);
+    const uint8_t * src_lo =
+        y_bytes + (int64_t) frag_idx * 16 * ncols_y + col_start * 16;
+    const uint8_t * src_hi =
+        y_bytes + 128 * ncols_y + (int64_t) frag_idx * 16 * ncols_y + col_start * 16;
+    const uint8_t * src_scale =
+        y_bytes + 256 * ncols_y + (int64_t) frag_idx * scale_stride + col_start;
+    bool use_tma_scale = false;
+    if constexpr (J % 16 == 0) {
+        use_tma_scale = (reinterpret_cast<uintptr_t>(src_scale) & 15) == 0;
+    }
+
+    ggml_cuda_w4a8_tma_barrier_arrive_expect_tx(ready_barrier,
+        2 * plane_bytes + (use_tma_scale ? scale_bytes : 0));
+    if (!use_tma_scale) {
+#pragma unroll 1
+        for (int col = 0; col < J; ++col) {
+            cache->scales[col] = src_scale[col];
+        }
+        __threadfence_block();
+    }
+    ggml_cuda_w4a8_tma_load(
+        cache->qs, src_lo, plane_bytes, ready_barrier);
+    ggml_cuda_w4a8_tma_load(
+        cache->qs + J * 4,
+        src_hi, plane_bytes, ready_barrier);
+    if constexpr (J % 16 == 0) {
+        if (use_tma_scale) {
+            ggml_cuda_w4a8_tma_load(
+                cache->scales, src_scale, scale_bytes, ready_barrier);
+        }
+    }
+}
+
+template <int J>
+static __device__ __forceinline__ void ggml_cuda_w4a8_load_b_tile_cached(
+        tile<8, 8, int> & tile_b,
+        uint32_t & scale_b,
+        const ggml_cuda_w4a8_b_fragment_cache<J> * cache,
+        const int col_base) {
+    const int lane  = int(threadIdx.x) & 31;
+    const int col   = col_base + (lane >> 2);
+    const int group = lane & 3;
+    const uint32_t * cache_lo = cache->qs + col * 4;
+    const uint32_t * cache_hi = cache->qs + J * 4 + col * 4;
+    int * tx = reinterpret_cast<int *>(tile_b.x);
+    tx[0] = static_cast<int>(cache_lo[group]);
+    tx[1] = static_cast<int>(cache_hi[group]);
+    scale_b = cache->scales[col];
+}
+
+template <int J>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_nvfp4_w4a8_tma_cached_fragment(
+        const block_nvfp4_blackwell_w4a8 * __restrict__ x_blocks,
+        float * __restrict__ sum,
+        const ggml_cuda_w4a8_b_fragment_cache<J> * cache,
+        const int frag_idx,
+        const int i_max,
+        const float tensor_scale) {
+    typedef tile<16, 8, int>   tile_A;
+    typedef tile<8,  8, int>   tile_B;
+    typedef tile<16, 8, float> tile_C;
+
+    constexpr int rows_per_warp = J >= 48 ? 32 : 16;
+    constexpr int ntx           = rows_per_warp / tile_C::I;
+
+    const int ty = threadIdx.y;
+    const int ty_ntx_mod = ty % ntx;
+    const int ty_ntx_div = ty / ntx;
+    const int i0 = ty_ntx_div * rows_per_warp;
+
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+        uint32_t packed[2];
+        uint32_t scale_pair;
+        tile_A A;
+        ggml_cuda_mmq_load_nvfp4_w4a8_tile_A<false>(
+            packed, scale_pair, x_blocks, 1, i0 + n * tile_A::I, frag_idx, i_max);
+        ggml_cuda_mmq_w4a8_make_scaled_e4m3_tile_A_repacked(A, packed, scale_pair);
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += ntx * tile_C::J) {
+            tile_B B;
+            uint32_t scale_b;
+            tile_C C = {};
+            ggml_cuda_w4a8_load_b_tile_cached<J>(
+                B, scale_b, cache, ty_ntx_mod * tile_C::J + j0);
+            mma_mxfp8_fp8(C, A, B, scale_b);
+            float * __restrict__ sum_n = sum + (j0 / tile_C::J + n) * tile_C::ne;
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                sum_n[l] += C.x[l] * (8.0f * tensor_scale);
+            }
+        }
+    }
+}
+
+template <int J>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_nvfp4_w4a8_tma_weight_fragment(
+        const block_nvfp4_blackwell_w4a8 * __restrict__ x_blocks,
+        float * __restrict__ sum,
+        const block_nvfp4_w4a8_mmq * __restrict__ y,
+        const int ncols_y,
+        const int col_start,
+        const int frag_idx,
+        const int i_max,
+        const float tensor_scale) {
+    typedef tile<16, 8, int>   tile_A;
+    typedef tile<8,  8, int>   tile_B;
+    typedef tile<16, 8, float> tile_C;
+
+    constexpr int rows_per_warp = J >= 48 ? 32 : 16;
+    constexpr int ntx           = rows_per_warp / tile_C::I;
+
+    const int ty = threadIdx.y;
+    const int ty_ntx_mod = ty % ntx;
+    const int ty_ntx_div = ty / ntx;
+    const int i0 = ty_ntx_div * rows_per_warp;
+    const int col_warp = col_start + ty_ntx_mod * tile_C::J;
+
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+        uint32_t packed[2];
+        uint32_t scale_pair;
+        tile_A A;
+        ggml_cuda_mmq_load_nvfp4_w4a8_tile_A<false>(
+            packed, scale_pair, x_blocks, 1, i0 + n * tile_A::I, frag_idx, i_max);
+        ggml_cuda_mmq_w4a8_make_scaled_e4m3_tile_A_repacked(A, packed, scale_pair);
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += ntx * tile_C::J) {
+            tile_B B;
+            uint32_t scale_b;
+            tile_C C = {};
+            ggml_cuda_mmq_load_w4a8_tile_B<J>(
+                B, scale_b, y, ncols_y, col_warp + j0, frag_idx);
+            mma_mxfp8_fp8(C, A, B, scale_b);
+            float * __restrict__ sum_n = sum + (j0 / tile_C::J + n) * tile_C::ne;
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                sum_n[l] += C.x[l] * (8.0f * tensor_scale);
+            }
+        }
+    }
+}
+
 template <int J, bool fallback, bool fixup, int nvfp4_mode = 0, bool nvfp4_dense = false>
 static __device__ __forceinline__ void ggml_cuda_mmq_process_nvfp4_direct(
         const char * __restrict__ x,
@@ -990,6 +1254,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_process_nvfp4_direct(
         const float * __restrict__ y_scale,
         const int stride_row_x,
         const int ncols_y,
+        const int col_start,
         const int stride_col_dst,
         const int tile_x_max_i,
         const int tile_y_max_j,
@@ -1027,11 +1292,132 @@ static __device__ __forceinline__ void ggml_cuda_mmq_process_nvfp4_direct(
                 sum, 0, tile_x_max_i, tensor_scale);
         }
     } else if constexpr (nvfp4_mode == 1) {
-        for (int k_block = k_block_start; k_block < k_block_stop; ++k_block) {
-            ggml_cuda_mmq_vec_dot_nvfp4_w4a8_repacked_direct<J, fallback>(
-                reinterpret_cast<const block_nvfp4_blackwell_w4a8 *>(x_blocks) + k_block,
-                stride_row_x, y_w4a8 + ncols_y * k_block,
-                sum, 0, tile_x_max_i, tensor_scale);
+        if constexpr (!fallback && (J == 64 || J == 128)) {
+            extern __shared__ int mmq_shared[];
+            constexpr size_t ids_bytes = nvfp4_dense ? 0 : ((J * sizeof(int) + 15) & ~size_t(15));
+            char * tma_shared = reinterpret_cast<char *>(mmq_shared) + ids_bytes;
+            auto * stages = reinterpret_cast<block_nvfp4_blackwell_w4a8 *>(tma_shared);
+            auto * ready_barriers = reinterpret_cast<uint64_t *>(
+                tma_shared + GGML_CUDA_W4A8_TMA_STAGES * GGML_CUDA_W4A8_TMA_STAGE_BYTES);
+            auto * consumed_barriers = ready_barriers + GGML_CUDA_W4A8_TMA_STAGES;
+            auto * b_caches = reinterpret_cast<ggml_cuda_w4a8_b_fragment_cache<J> *>(
+                tma_shared + GGML_CUDA_W4A8_TMA_BYTES);
+            auto * b_ready_barriers = reinterpret_cast<uint64_t *>(
+                reinterpret_cast<char *>(b_caches + GGML_CUDA_W4A8_B_STAGES));
+            auto * b_consumed_barriers = b_ready_barriers + GGML_CUDA_W4A8_B_STAGES;
+            const auto * x_blocks_w4a8 = reinterpret_cast<const block_nvfp4_blackwell_w4a8 *>(x_blocks);
+            const int n_k_blocks = k_block_stop - k_block_start;
+            const int n_b_fragments = n_k_blocks * 8;
+            const bool elected = threadIdx.x == 0 && threadIdx.y == 0;
+
+            if (elected) {
+#pragma unroll
+                for (int stage = 0; stage < GGML_CUDA_W4A8_TMA_STAGES; ++stage) {
+                    ggml_cuda_w4a8_tma_barrier_init(ready_barriers + stage, 1);
+                    ggml_cuda_w4a8_tma_barrier_init(consumed_barriers + stage, nwarps);
+                    if constexpr (J == 128) {
+                        ggml_cuda_w4a8_tma_barrier_init(b_ready_barriers + stage, 1);
+                        ggml_cuda_w4a8_tma_barrier_init(b_consumed_barriers + stage, nwarps);
+                    }
+                }
+            }
+            __syncthreads();
+
+            if (elected && n_k_blocks > 0) {
+                ggml_cuda_w4a8_tma_issue_stage(
+                    stages,
+                    x_blocks_w4a8 + k_block_start,
+                    stride_row_x,
+                    ready_barriers);
+                if (n_k_blocks > 1) {
+                    ggml_cuda_w4a8_tma_issue_stage(
+                        stages + GGML_CUDA_W4A8_TMA_ROW_TILES,
+                        x_blocks_w4a8 + k_block_start + 1,
+                        stride_row_x,
+                        ready_barriers + 1);
+                }
+            }
+            if constexpr (J == 128) {
+                if (elected && n_b_fragments > 0) {
+                    ggml_cuda_w4a8_issue_b_fragment<J>(
+                        b_caches,
+                        y_w4a8 + ncols_y * k_block_start,
+                        ncols_y,
+                        col_start,
+                        0,
+                        b_ready_barriers);
+                    if (n_b_fragments > 1) {
+                        ggml_cuda_w4a8_issue_b_fragment<J>(
+                            b_caches + 1,
+                            y_w4a8 + ncols_y * k_block_start,
+                            ncols_y,
+                            col_start,
+                            1,
+                            b_ready_barriers + 1);
+                    }
+                }
+            }
+
+            for (int k_rel = 0; k_rel < n_k_blocks; ++k_rel) {
+                const int stage = k_rel & 1;
+                const int phase = (k_rel >> 1) & 1;
+                ggml_cuda_w4a8_tma_barrier_wait(ready_barriers + stage, phase);
+#pragma unroll
+                for (int frag_idx = 0; frag_idx < 8; ++frag_idx) {
+                    const int b_rel = k_rel * 8 + frag_idx;
+                    const int b_stage = b_rel & 1;
+                    const int b_phase = (b_rel >> 1) & 1;
+                    if constexpr (J == 128) {
+                        ggml_cuda_w4a8_tma_barrier_wait(b_ready_barriers + b_stage, b_phase);
+                        ggml_cuda_mmq_vec_dot_nvfp4_w4a8_tma_cached_fragment<J>(
+                            stages + stage * GGML_CUDA_W4A8_TMA_ROW_TILES,
+                            sum, b_caches + b_stage, frag_idx, tile_x_max_i, tensor_scale);
+                        if (threadIdx.x == 0) {
+                            ggml_cuda_w4a8_tma_barrier_arrive(b_consumed_barriers + b_stage);
+                        }
+
+                        const int b_next_rel = b_rel + GGML_CUDA_W4A8_B_STAGES;
+                        if (elected && b_next_rel < n_b_fragments) {
+                            ggml_cuda_w4a8_tma_barrier_wait(
+                                b_consumed_barriers + b_stage, b_phase);
+                            const int b_next_k = b_next_rel / 8;
+                            const int b_next_frag = b_next_rel % 8;
+                            ggml_cuda_w4a8_issue_b_fragment<J>(
+                                b_caches + b_stage,
+                                y_w4a8 + ncols_y * (k_block_start + b_next_k),
+                                ncols_y,
+                                col_start,
+                                b_next_frag,
+                                b_ready_barriers + b_stage);
+                        }
+                    } else {
+                        ggml_cuda_mmq_vec_dot_nvfp4_w4a8_tma_weight_fragment<J>(
+                            stages + stage * GGML_CUDA_W4A8_TMA_ROW_TILES,
+                            sum, y_w4a8 + ncols_y * (k_block_start + k_rel),
+                            ncols_y, col_start, frag_idx, tile_x_max_i, tensor_scale);
+                    }
+                }
+                if (threadIdx.x == 0) {
+                    ggml_cuda_w4a8_tma_barrier_arrive(consumed_barriers + stage);
+                }
+
+                const int k_next_rel = k_rel + GGML_CUDA_W4A8_TMA_STAGES;
+                if (elected && k_next_rel < n_k_blocks) {
+                    ggml_cuda_w4a8_tma_barrier_wait(consumed_barriers + stage, phase);
+                    ggml_cuda_w4a8_tma_issue_stage(
+                        stages + stage * GGML_CUDA_W4A8_TMA_ROW_TILES,
+                        x_blocks_w4a8 + k_block_start + k_next_rel,
+                        stride_row_x,
+                        ready_barriers + stage);
+                }
+            }
+        } else {
+            for (int k_block = k_block_start; k_block < k_block_stop; ++k_block) {
+                ggml_cuda_mmq_vec_dot_nvfp4_w4a8_repacked_direct<J, fallback>(
+                    reinterpret_cast<const block_nvfp4_blackwell_w4a8 *>(x_blocks) + k_block,
+                    stride_row_x, y_w4a8 + ncols_y * k_block,
+                    sum, 0, tile_x_max_i, ncols_y, col_start, tensor_scale);
+            }
         }
     } else {
         if (w4a44) {
@@ -1044,7 +1430,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_process_nvfp4_direct(
             for (int k_block = k_block_start; k_block < k_block_stop; ++k_block) {
                 ggml_cuda_mmq_vec_dot_nvfp4_w4a8_direct<J, fallback>(
                     x_blocks + k_block, stride_row_x, y_w4a8 + ncols_y * k_block,
-                    sum, 0, tile_x_max_i, tensor_scale);
+                    sum, 0, tile_x_max_i, ncols_y, col_start, tensor_scale);
             }
         } else {
             for (int k_block = k_block_start; k_block < k_block_stop; ++k_block) {
@@ -1165,11 +1551,11 @@ static __global__ void mul_mat_q(
         if constexpr (type == GGML_TYPE_NVFP4 && nvfp4_mode == 2) {
             offset_y += (col_low + jt * J) * sizeof(block_nvfp4_w4a44_mmq) / sizeof(int);
         } else if constexpr (type == GGML_TYPE_NVFP4 && nvfp4_mode == 1) {
-            offset_y += (col_low + jt * J) * sizeof(block_nvfp4_w4a8_mmq) / sizeof(int);
         } else {
-            offset_y += (col_low + jt * J) *
-                (w4a44 ? sizeof(block_nvfp4_w4a44_mmq) :
-                 w4a8  ? sizeof(block_nvfp4_w4a8_mmq)  : sizeof(block_q8_1_mmq)) / sizeof(int);
+            if (!w4a8) {
+                offset_y += (col_low + jt * J) *
+                    (w4a44 ? sizeof(block_nvfp4_w4a44_mmq) : sizeof(block_q8_1_mmq)) / sizeof(int);
+            }
         }
         offset_dst += it*I;
 
@@ -1191,7 +1577,7 @@ static __global__ void mul_mat_q(
             ggml_cuda_mmq_process_nvfp4_direct<J, fallback, fixup, nvfp4_mode, nvfp4_dense>(
                 active_x, offset_x_fp4, active_y + offset_y, ids_dst_shared, active_dst + offset_dst,
                 active_tmp_fixup, y_scale_tile,
-                stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j,
+                stride_row_x, ncols_y, col_low + jt * J, stride_col_dst, tile_x_max_i, tile_y_max_j,
                 0, blocks_per_ne00.z, stream_block_x, scale_channel, w4a8, w4a44);
         } else
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
@@ -1270,11 +1656,11 @@ static __global__ void mul_mat_q(
         if constexpr (type == GGML_TYPE_NVFP4 && nvfp4_mode == 2) {
             offset_y += (col_low + jt * J) * sizeof(block_nvfp4_w4a44_mmq) / sizeof(int);
         } else if constexpr (type == GGML_TYPE_NVFP4 && nvfp4_mode == 1) {
-            offset_y += (col_low + jt * J) * sizeof(block_nvfp4_w4a8_mmq) / sizeof(int);
         } else {
-            offset_y += (col_low + jt * J) *
-                (w4a44 ? sizeof(block_nvfp4_w4a44_mmq) :
-                 w4a8  ? sizeof(block_nvfp4_w4a8_mmq)  : sizeof(block_q8_1_mmq)) / sizeof(int);
+            if (!w4a8) {
+                offset_y += (col_low + jt * J) *
+                    (w4a44 ? sizeof(block_nvfp4_w4a44_mmq) : sizeof(block_q8_1_mmq)) / sizeof(int);
+            }
         }
         offset_dst += it*I;
 
@@ -1296,7 +1682,7 @@ static __global__ void mul_mat_q(
             ggml_cuda_mmq_process_nvfp4_direct<J, fallback, fixup, nvfp4_mode, nvfp4_dense>(
                 active_x, offset_x_fp4, active_y + offset_y, ids_dst_shared, active_dst + offset_dst,
                 active_tmp_fixup, y_scale_tile,
-                stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j,
+                stride_row_x, ncols_y, col_low + jt * J, stride_col_dst, tile_x_max_i, tile_y_max_j,
                 kb0_start, kb0_stop, stream_block_x, scale_channel, w4a8, w4a44);
         } else
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
@@ -1365,11 +1751,11 @@ static __global__ void mul_mat_q(
     if constexpr (type == GGML_TYPE_NVFP4 && nvfp4_mode == 2) {
         offset_y += (col_low + jt * J) * sizeof(block_nvfp4_w4a44_mmq) / sizeof(int);
     } else if constexpr (type == GGML_TYPE_NVFP4 && nvfp4_mode == 1) {
-        offset_y += (col_low + jt * J) * sizeof(block_nvfp4_w4a8_mmq) / sizeof(int);
     } else {
-        offset_y += (col_low + jt * J) *
-            (w4a44 ? sizeof(block_nvfp4_w4a44_mmq) :
-             w4a8  ? sizeof(block_nvfp4_w4a8_mmq)  : sizeof(block_q8_1_mmq)) / sizeof(int);
+        if (!w4a8) {
+            offset_y += (col_low + jt * J) *
+                (w4a44 ? sizeof(block_nvfp4_w4a44_mmq) : sizeof(block_q8_1_mmq)) / sizeof(int);
+        }
     }
     offset_dst += it*I;
 
@@ -1391,7 +1777,7 @@ static __global__ void mul_mat_q(
         ggml_cuda_mmq_process_nvfp4_direct<J, fallback, fixup, nvfp4_mode, nvfp4_dense>(
             active_x, offset_x_fp4, active_y + offset_y, ids_dst_shared, active_dst + offset_dst,
             active_tmp_fixup, y_scale_tile,
-            stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j,
+            stride_row_x, ncols_y, col_low + jt * J, stride_col_dst, tile_x_max_i, tile_y_max_j,
             kb0_start, kb0_stop, stream_block_x, scale_channel, w4a8, w4a44);
     } else
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
@@ -1585,7 +1971,14 @@ static void launch_mul_mat_q(
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
     GGML_ASSERT(config.nthreads % warp_size == 0);
     const int nwarps = config.nthreads / warp_size;
-    const int nbytes_shared = nvfp4_dense ? 0 : mmq_get_nbytes_shared(config, cc);
+    const int nbytes_ids = nvfp4_dense ? 0 : mmq_get_nbytes_shared(config, cc);
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    constexpr bool use_w4a8_tma =
+        type == GGML_TYPE_NVFP4 && nvfp4_mode == 1 && !fallback && (J == 64 || J == 128);
+    const int nbytes_shared = nbytes_ids + (use_w4a8_tma ? ggml_cuda_w4a8_shared_bytes<J>() : 0);
+#else
+    const int nbytes_shared = nbytes_ids;
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
