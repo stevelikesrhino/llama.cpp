@@ -338,6 +338,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool nvfp4_w4a8;      // use the W4A8-specific CUDA NVFP4 weight layout
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool load_mtp;        // whether to load MTP layers
     };
 
     struct llama_sampler_seq_config {
