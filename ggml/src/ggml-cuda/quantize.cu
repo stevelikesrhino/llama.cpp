@@ -14,6 +14,46 @@ struct __builtin_align__(32) ggml_cuda_float8 {
     float x7;
 };
 
+#if CUDART_VERSION >= 12080
+static __device__ __forceinline__ float nvfp4_native_scale_error(
+        const float vals[QK_NVFP4_SUB], const float inv_col_scale, const float inv_scale, const float scale) {
+    const float scale_dequant = 2.0f * scale;
+    float err = 0.0f;
+
+#pragma unroll
+    for (int k = 0; k < QK_NVFP4_SUB; k += 4) {
+        const float v0 = vals[k + 0] * inv_col_scale;
+        const float v1 = vals[k + 1] * inv_col_scale;
+        const float v2 = vals[k + 2] * inv_col_scale;
+        const float v3 = vals[k + 3] * inv_col_scale;
+
+        const __nv_fp4x4_e2m1 q(make_float4(v0 * inv_scale, v1 * inv_scale, v2 * inv_scale, v3 * inv_scale));
+        const __nv_fp4x4_storage_t q_storage = q.__x;
+        const __nv_fp4x2_storage_t q_lo = static_cast<__nv_fp4x2_storage_t>(q_storage);
+        const __nv_fp4x2_storage_t q_hi = static_cast<__nv_fp4x2_storage_t>(q_storage >> 8U);
+
+        const __half2_raw hraw2_lo = __nv_cvt_fp4x2_to_halfraw2(q_lo, __NV_E2M1);
+        const __half2_raw hraw2_hi = __nv_cvt_fp4x2_to_halfraw2(q_hi, __NV_E2M1);
+        const __half2 h2_lo = static_cast<__half2>(hraw2_lo);
+        const __half2 h2_hi = static_cast<__half2>(hraw2_hi);
+        const float2 dq_lo = __half22float2(h2_lo);
+        const float2 dq_hi = __half22float2(h2_hi);
+
+        const float err0 = fabsf(v0) - fabsf(dq_lo.x) * scale_dequant;
+        const float err1 = fabsf(v1) - fabsf(dq_lo.y) * scale_dequant;
+        const float err2 = fabsf(v2) - fabsf(dq_hi.x) * scale_dequant;
+        const float err3 = fabsf(v3) - fabsf(dq_hi.y) * scale_dequant;
+
+        err = fmaf(err0, err0, err);
+        err = fmaf(err1, err1, err);
+        err = fmaf(err2, err2, err);
+        err = fmaf(err3, err3, err);
+    }
+
+    return err;
+}
+#endif // CUDART_VERSION >= 12080
+
 template <bool use_aligned_float8>
 static __device__ __forceinline__ void ggml_cuda_load_nvfp4_values(
         const float * __restrict__ x, const int64_t i0, const int64_t ne00,
