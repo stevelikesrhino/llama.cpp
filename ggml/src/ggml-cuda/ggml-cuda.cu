@@ -743,9 +743,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             if (streams[i][j] != nullptr) {
                 CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
             }
-        }
-        if (cublas_handles[i] != nullptr) {
-            CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
+            if (cublas_handles[i][j] != nullptr) {
+                CUBLAS_CHECK(cublasDestroy(cublas_handles[i][j]));
+            }
+            if (cublas_workspaces[i][j] != nullptr) {
+                CUDA_CHECK(cudaFree(cublas_workspaces[i][j]));
+            }
         }
     }
 }
@@ -2100,6 +2103,7 @@ static void ggml_cuda_op_mul_mat_cublas(
     int64_t ldc = id == ctx.device ? ne0 : row_diff;
 
     const int cc = ggml_cuda_info().devices[id].cc;
+    cublasHandle_t cublas_h = ctx.cublas_handle(id, stream);
 
     const bool supports_bf16 = GGML_CUDA_CC_IS_NVIDIA(cc) || GGML_CUDA_CC_IS_AMD(cc) ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
@@ -2127,9 +2131,8 @@ static void ggml_cuda_op_mul_mat_cublas(
         const float alpha_f32 = 1.0f;
         const float beta_f32  = 0.0f;
 
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
         CUBLAS_CHECK(
-            cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+            cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     row_diff, src1_ncols, ne10,
                     &alpha_f32,  src0_ptr,       CUDA_R_16BF, ne00,
                                  src1_ptr,       CUDA_R_16BF, ne10,
@@ -2161,8 +2164,6 @@ static void ggml_cuda_op_mul_mat_cublas(
         }
         const half * src1_ptr = src1->type == GGML_TYPE_F16 ? (const half *) src1_ddf_i : src1_as_f16.get();
 
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
-
         const auto & force_compute_type = ggml_cuda_cublas_get_force_compute_type();
 
         if (!force_compute_type.fp16 && (GGML_CUDA_CC_IS_CDNA(cc)
@@ -2173,7 +2174,7 @@ static void ggml_cuda_op_mul_mat_cublas(
             const float alpha = 1.0f;
             const float beta = 0.0f;
             CUBLAS_CHECK(
-                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                         row_diff, src1_ncols, ne10,
                         &alpha, src0_ptr,  CUDA_R_16F, ne00,
                                 src1_ptr,  CUDA_R_16F, ne10,
@@ -2187,7 +2188,7 @@ static void ggml_cuda_op_mul_mat_cublas(
             const half beta_f16 = 0.0f;
 
             CUBLAS_CHECK(
-                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                         row_diff, src1_ncols, ne10,
                         &alpha_f16, src0_ptr,      CUDA_R_16F, ne00,
                                     src1_ptr,      CUDA_R_16F, ne10,
@@ -2221,9 +2222,8 @@ static void ggml_cuda_op_mul_mat_cublas(
         const float alpha = 1.0f;
         const float beta = 0.0f;
 
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
         CUBLAS_CHECK(
-            cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+            cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     row_diff, src1_ncols, ne10,
                     &alpha, src0_ddf_i,  ne00,
                             src1_ddf1_i, ne10,
@@ -2410,7 +2410,7 @@ static void ggml_cuda_op_mul_mat(
         const bool  dst_on_device = id == dst_ctx->device;
 
         ggml_cuda_set_device(id);
-        cudaStream_t stream = ctx.stream(id, 0);
+        cudaStream_t stream = split ? ctx.stream(id, 0) : ctx.stream();
 
         if (src0_is_contiguous) {
             dev[id].src0_dd = split ? (char *) src0_extra->data_device[id] : (char *) src0->data;
@@ -2505,7 +2505,7 @@ static void ggml_cuda_op_mul_mat(
             const int64_t row_diff = dev[id].row_high - dev[id].row_low;
 
             ggml_cuda_set_device(id);
-            cudaStream_t stream = ctx.stream(id, is);
+            cudaStream_t stream = split ? ctx.stream(id, is) : ctx.stream();
 
             // wait for main GPU data if necessary
             if (split && (id != ctx.device || is != 0)) {
@@ -2732,7 +2732,7 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
 
     const int64_t ne_dst = ggml_nelements(dst);
     cudaStream_t main_stream = ctx.stream();
-    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), main_stream));
+    cublasHandle_t cublas_h = ctx.cublas_handle();
 
     float * dst_ddf = (float *) dst->data;
     const size_t ts_src1 = ggml_type_size(src1->type);
@@ -2831,7 +2831,7 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
         // there is no broadcast and src0, src1 are contiguous across dims 2, 3
         // use cublasGemmStridedBatchedEx
         CUBLAS_CHECK(
-        cublasGemmStridedBatchedEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        cublasGemmStridedBatchedEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                 ne01, ne11, ne10,
                 alpha, src0_ptr, cu_data_type_a, nb01/nb00, sma,     // strideA
                        src1_ptr, cu_data_type_b, s11,       smb,     // strideB
@@ -2870,7 +2870,7 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
         CUDA_CHECK(cudaGetLastError());
 
         CUBLAS_CHECK(
-        cublasGemmBatchedEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        cublasGemmBatchedEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                 ne01, ne11, ne10,
                 alpha, (const void **) (ptrs_src.get() + 0*ne23), cu_data_type_a, nb01/nb00,
                        (const void **) (ptrs_src.get() + 1*ne23), cu_data_type_b, s11,
