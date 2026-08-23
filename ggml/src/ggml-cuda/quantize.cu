@@ -168,6 +168,41 @@ static __device__ __forceinline__ float ggml_cuda_fp4x2_mse(
     return e0 * e0 + e1 * e1;
 }
 
+static __device__ __forceinline__ uint32_t ggml_cuda_fp32x8_to_fp4_e2m1(
+        const float (&x)[8], const float inv_scale) {
+    float v[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        v[k] = x[k] * inv_scale;
+    }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
+    uint32_t packed;
+    asm volatile(
+        "{\n"
+        ".reg .b8 byte0;\n"
+        ".reg .b8 byte1;\n"
+        ".reg .b8 byte2;\n"
+        ".reg .b8 byte3;\n"
+        "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
+        "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
+        "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
+        "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
+        "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+        "}"
+        : "=r"(packed)
+        : "f"(v[0]), "f"(v[1]), "f"(v[2]), "f"(v[3]), "f"(v[4]), "f"(v[5]), "f"(v[6]), "f"(v[7]));
+    return packed;
+#else
+    uint32_t packed = 0;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        packed |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(v[k], 1.0f) << (4 * k);
+    }
+    return packed;
+#endif
+}
+
 static __device__ __forceinline__ uint32_t ggml_cuda_fp32x8_to_fp4_e2m1_mse(
         const float (&x)[8], const float inv_scale, const float dequant_scale, float & err) {
     float v[8];
@@ -255,15 +290,22 @@ static __device__ __forceinline__ void ggml_cuda_nvfp4_quantize_4o6_mse(
     fp8_code = use4 ? fp8_code4 : fp8_code6;
 }
 
-static __device__ __forceinline__ void ggml_cuda_nvfp4_quantize_4o6_residual(
+static __device__ __forceinline__ void ggml_cuda_nvfp4_quantize_w4a44_residual(
         const float (&vals0)[8], const float (&vals1)[8], const float sub_max,
         uint32_t & plane0_0, uint32_t & plane0_1,
         uint32_t & plane1_0, uint32_t & plane1_1,
         uint8_t & fp8_code) {
-    ggml_cuda_nvfp4_quantize_4o6_mse(vals0, vals1, sub_max, plane0_0, plane0_1, fp8_code);
+    constexpr float PRIMARY_DIVISOR = 6.5f;
+    constexpr float SCALE_EPS       = 0.001953125f;
 
+    const float scale_f = fmaxf(sub_max * (1.0f / PRIMARY_DIVISOR), SCALE_EPS);
+    fp8_code = ggml_cuda_fp32_to_ue4m3(scale_f);
     const float subblock_scale = ggml_cuda_ue4m3_to_fp32(fp8_code);
+    const float inv_scale      = subblock_scale > 0.0f ? 0.5f / subblock_scale : 0.0f;
     const float dequant_scale  = 2.0f * subblock_scale;
+    plane0_0 = ggml_cuda_fp32x8_to_fp4_e2m1(vals0, inv_scale);
+    plane0_1 = ggml_cuda_fp32x8_to_fp4_e2m1(vals1, inv_scale);
+
     float residual0[8];
     float residual1[8];
 #pragma unroll
@@ -274,9 +316,8 @@ static __device__ __forceinline__ void ggml_cuda_nvfp4_quantize_4o6_residual(
         residual1[k] = 6.0f * (vals1[k] / dequant_scale - q1);
     }
 
-    float residual_err = 0.0f;
-    plane1_0 = ggml_cuda_fp32x8_to_fp4_e2m1_mse(residual0, 1.0f, 1.0f, residual_err);
-    plane1_1 = ggml_cuda_fp32x8_to_fp4_e2m1_mse(residual1, 1.0f, 1.0f, residual_err);
+    plane1_0 = ggml_cuda_fp32x8_to_fp4_e2m1(residual0, 1.0f);
+    plane1_1 = ggml_cuda_fp32x8_to_fp4_e2m1(residual1, 1.0f);
 }
 
 bool ggml_cuda_can_quantize_nvfp4_glu(const ggml_tensor * src) {
@@ -933,7 +974,7 @@ static __global__ void quantize_mmq_nvfp4_w4a44(
         uint32_t plane1_0;
         uint32_t plane1_1;
         uint8_t fp8_code;
-        ggml_cuda_nvfp4_quantize_4o6_residual(
+        ggml_cuda_nvfp4_quantize_w4a44_residual(
             vals0, vals1, sub_max, plane0_0, plane0_1, plane1_0, plane1_1, fp8_code);
         yb->qs0_u32[2 * sub + 0] = plane0_0;
         yb->qs0_u32[2 * sub + 1] = plane0_1;
@@ -1043,7 +1084,7 @@ static __global__ void quantize_mmq_nvfp4_w4a44_glu(
         uint32_t plane1_0;
         uint32_t plane1_1;
         uint8_t fp8_code;
-        ggml_cuda_nvfp4_quantize_4o6_residual(
+        ggml_cuda_nvfp4_quantize_w4a44_residual(
             vals0, vals1, sub_max, plane0_0, plane0_1, plane1_0, plane1_1, fp8_code);
         yb->qs0_u32[2 * sub + 0] = plane0_0;
         yb->qs0_u32[2 * sub + 1] = plane0_1;
