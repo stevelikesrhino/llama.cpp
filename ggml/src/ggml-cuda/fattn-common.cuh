@@ -661,10 +661,11 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     }
 }
 
-template <int ncols1>
+template <int ncols1, int DV>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
-        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
+        const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33, const int ne33,
+        float * dst_ptr, const int ne01, const int ne02) {
     const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
     int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
 
@@ -673,7 +674,7 @@ static __global__ void flash_attn_mask_to_KV_max(
     const int sequence = blockIdx.y;
     const int jt       = blockIdx.x;
 
-    mask += sequence*s33 + jt*ncols1*s31;
+    mask += (sequence % ne33)*s33 + jt*ncols1*s31;
 
     __shared__ int buf_iw[WARP_SIZE];
     if (tid < WARP_SIZE) {
@@ -688,8 +689,10 @@ static __global__ void flash_attn_mask_to_KV_max(
 
 #pragma unroll
         for (int j = 0; j < ncols1; ++j) {
-            const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
-            all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            if (jt*ncols1 + j < ne01) {
+                const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
+                all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            }
         }
 
         all_inf = warp_reduce_all(all_inf);
@@ -711,11 +714,26 @@ static __global__ void flash_attn_mask_to_KV_max(
     // In either case, walk back the decrementation by FATTN_KQ_STRIDE.
     KV_max_sj += FATTN_KQ_STRIDE;
 
-    if (threadIdx.x != 0) {
-        return;
+    if (threadIdx.x == 0) {
+        KV_max[sequence*ne31 + jt] = KV_max_sj;
     }
 
-    KV_max[sequence*ne31 + jt] = KV_max_sj;
+    if constexpr (DV > 0) {
+        if (KV_max_sj == 0) {
+            for (int i = tid; i < ncols1*ne02*DV; i += blockDim.x) {
+                const int k = i % DV;
+                const int ih = i / DV;
+                const int h = ih % ne02;
+                const int j = ih / ne02;
+                const int iq = jt*ncols1 + j;
+                if (iq < ne01) {
+                    dst_ptr[((int64_t(sequence)*ne01 + iq)*ne02 + h)*DV + k] = 0.0f;
+                }
+            }
+        }
+    } else {
+        GGML_UNUSED_VARS(dst_ptr, ne01, ne02);
+    }
 }
 
 template<int D, int ncols1, int ncols2> // D == head size
@@ -966,7 +984,7 @@ static __global__ void flash_attn_combine_results(
         VKQ_denominator += KQ_max_scale * meta[l].y;
     }
 
-    dst[tid] = VKQ_numerator / VKQ_denominator;
+    dst[tid] = VKQ_denominator == 0.0f ? 0.0f : VKQ_numerator / VKQ_denominator;
 }
 
 template <int DV, int ncols1, int ncols2>
@@ -1103,8 +1121,8 @@ void launch_fattn(
 
         KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
-        ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+        ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1, 0>, launch_params,
+            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33, int(mask->ne[3]), nullptr, int(Q->ne[1]), 0);
         CUDA_CHECK(cudaGetLastError());
     }
 

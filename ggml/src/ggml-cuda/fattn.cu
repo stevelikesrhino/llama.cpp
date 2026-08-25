@@ -1,6 +1,9 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+#include "fattn-mma-f16-sm120.cuh"
+#endif
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -30,6 +33,18 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         return;
     }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+    if constexpr (DKQ == DV &&
+            ((DKQ == 128 && ncols2 == 8) ||
+             (DKQ == 256 && (ncols2 == 8 || ncols2 == 2)) ||
+             (DKQ == 512 && ncols2 == 8))) {
+        constexpr int ncols1 = 64/ncols2;
+        if (ggml_cuda_fattn_sm120::supported<DKQ, ncols1, ncols2>(dst, cc)) {
+            ggml_cuda_fattn_sm120::launch<DKQ, ncols1, ncols2>(ctx, dst);
+            return;
+        }
+    }
+#endif
     ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
 }
 

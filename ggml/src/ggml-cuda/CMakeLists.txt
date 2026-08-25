@@ -176,9 +176,8 @@ if (CUDAToolkit_FOUND)
         target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
     endif()
 
-    if (GGML_CUDA_NO_VMM)
-        # No VMM requested, no need to link directly with the cuda driver lib (libcuda.so)
-    else()
+    # VMM and SM120 tensor-map encoding use direct CUDA Driver API calls.
+    if (NOT GGML_CUDA_NO_VMM OR CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
         target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
     endif()
 

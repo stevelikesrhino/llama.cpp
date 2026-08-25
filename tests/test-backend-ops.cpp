@@ -7404,9 +7404,12 @@ struct test_flash_attn_ext : public test_case {
     std::array<int32_t, 4> permute;
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
+    const bool mask_all_inf;
+    const bool mask_broadcast;
 
     std::string vars() override {
-        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k);
+        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k) +
+               ",mask_all_inf=" + std::to_string(mask_all_inf) + ",mask_broadcast=" + std::to_string(mask_broadcast);
     }
 
     double max_nmse_err() override {
@@ -7423,9 +7426,10 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false)
+                        bool kv_view = true, bool v_is_view_of_k = false, bool mask_all_inf = false, bool mask_broadcast = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k),
+          mask_all_inf(mask_all_inf), mask_broadcast(mask_broadcast) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7473,7 +7477,7 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, mask_broadcast ? 1 : nr23[1]);
             ggml_set_name(m, "m");
         }
 
@@ -7497,7 +7501,15 @@ struct test_flash_attn_ext : public test_case {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
-                init_tensor_kq_mask(t);
+                if (mask_all_inf) {
+                    const size_t n = ggml_nelements(t);
+                    std::vector<float> data_f32(n, -INFINITY);
+                    std::vector<ggml_fp16_t> data_f16(n);
+                    ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), n);
+                    ggml_backend_tensor_set(t, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+                } else {
+                    init_tensor_kq_mask(t);
+                }
             } else {
                 init_tensor_uniform(t);
             }
@@ -10303,6 +10315,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
+    // SM120 prefill acceptance geometries.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 2}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, { 6, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, { 2, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, { 2, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, { 8, 1}, 256, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, { 8, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, { 8, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // SM120 partial query tiles with sinks and softcap.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 512, 33, true, true, 0, 10, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, { 6, 1}, 512, 63, true, true, 0, 30, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, { 2, 1}, 512, 65, true, true, 0, 30, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, { 8, 1}, 512, 65, true, true, 0, 30, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // SM120 zero-KV tiles must write zero outputs, with or without attention sinks.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, { 8, 1}, 512, 33, true, false, 0, 30, GGML_PREC_F32,
+                                                        GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, { 8, 2}, 512, 33, true, true, 0, 30, GGML_PREC_F32,
+                                                        GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, true));
+
+    // SM120 masks can be broadcast across the sequence dimension.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, { 8, 2}, 512, 33, true, false, 0, 0, GGML_PREC_F32,
+                                                        GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, false, true));
+
+    // SM120 mask-derived KV limits at full ubatch.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 1024, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, { 6, 1}, 1024, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, { 2, 1}, 1024, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, { 8, 1}, 1024, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
     // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
@@ -10971,7 +11015,7 @@ static bool op_names_filter_selects(const char * op_names_filter, const char * o
 
 // Covers padded rows, sinks, kvpad, multi-SIMDgroup reduction, quantized K/V, and MLA views.
 // The override is backend-global, so this runs after all parallel workers have joined.
-static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu, const char * op_names_filter) {
+static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu, ggml_backend_buffer_type_t buft, const char * op_names_filter) {
     if (!op_names_filter_selects(op_names_filter, "FLASH_ATTN_EXT")) {
         return true;
     }
@@ -11002,7 +11046,7 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
                                 test_flash_attn_ext tc(s.dk, s.dv, /*nh=*/4, { 1, 1 }, /*kv=*/ne11, /*nb=*/ne01,
                                                        /*mask=*/true, sinks, 0.0f, 0.0f, GGML_PREC_F32,
                                                        type_kv, type_kv);
-                                auto st = tc.eval(backend, backend_cpu, "FLASH_ATTN_EXT", nullptr);
+                                auto st = tc.eval(backend, backend_cpu, buft, "FLASH_ATTN_EXT", nullptr);
                                 clear_ov();
 
                                 if (st == test_status_t::FAIL) {
@@ -11162,7 +11206,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         output_printer->print_summary(test_summary_info(n_ok, tests_run, false));
         output_printer->print_failed_tests(failed_tests);
 
-        const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
+        const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), test_buft, op_names_filter);
 
         return n_ok == tests_run && slice_ok;
     }
