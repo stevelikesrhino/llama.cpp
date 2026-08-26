@@ -1973,7 +1973,7 @@ struct mmq_args {
     bool use_stream_k; int64_t ncols_max; bool w4a8; bool w4a44; bool w4a8_layout;
 };
 
-static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
+static size_t mmq_get_nbytes_shared_base(const ggml_cuda_mmq_config & config, const int cc) {
 #if defined(BLACKWELL_MMA_AVAILABLE)
     if (config.type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc)) {
         return config.J * sizeof(int);
@@ -1983,6 +1983,24 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
+}
+
+template <ggml_type type, bool fallback, int nvfp4_mode, bool nvfp4_dense = false>
+static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
+    size_t nbytes = nvfp4_dense ? 0 : mmq_get_nbytes_shared_base(config, cc);
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    if constexpr (type == GGML_TYPE_NVFP4 && nvfp4_mode == 1 && !fallback) {
+        switch (config.J) {
+            case 64:
+                nbytes += ggml_cuda_w4a8_shared_bytes<64>();
+                break;
+            case 128:
+                nbytes += ggml_cuda_w4a8_shared_bytes<128>();
+                break;
+        }
+    }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+    return nbytes;
 }
 
 template <ggml_type type, int J, bool fallback, int nvfp4_mode = 0, bool nvfp4_dense = false, bool nvfp4_fusion = false>
@@ -1997,19 +2015,12 @@ static void launch_mul_mat_q(
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
     GGML_ASSERT(config.nthreads % warp_size == 0);
     const int nwarps = config.nthreads / warp_size;
-    const int nbytes_ids = nvfp4_dense ? 0 : mmq_get_nbytes_shared(config, cc);
-#if defined(BLACKWELL_MMA_AVAILABLE)
-    constexpr bool use_w4a8_tma =
-        type == GGML_TYPE_NVFP4 && nvfp4_mode == 1 && !fallback && (J == 64 || J == 128);
-    const int nbytes_shared = nbytes_ids + (use_w4a8_tma ? ggml_cuda_w4a8_shared_bytes<J>() : 0);
-#else
-    const int nbytes_shared = nbytes_ids;
-#endif // defined(BLACKWELL_MMA_AVAILABLE)
+    const size_t nbytes_shared = mmq_get_nbytes_shared<type, fallback, nvfp4_mode, nvfp4_dense>(config, cc);
+    GGML_ASSERT(nbytes_shared <= ggml_cuda_info().devices[id].smpbo);
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, nvfp4_mode, nvfp4_dense, nvfp4_fusion>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, nvfp4_mode, nvfp4_dense, nvfp4_fusion>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, fallback, nvfp4_mode, nvfp4_dense, nvfp4_fusion>), nbytes_shared);
 
     GGML_ASSERT(!nvfp4_fusion || fusion_args != nullptr);
     const char * x_fusion = nvfp4_fusion ? fusion_args->x : nullptr;
@@ -2121,7 +2132,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             continue;
         }
 
-        if (mmq_get_nbytes_shared(config, cc) > smpbo) {
+        if (mmq_get_nbytes_shared<type, fallback, nvfp4_mode>(config, cc) > smpbo) {
             continue;
         }
 
