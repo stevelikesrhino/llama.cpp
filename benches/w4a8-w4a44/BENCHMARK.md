@@ -86,6 +86,25 @@ Throughput is tokens per second. Values are the mean and standard deviation over
 | Qwen | W4A8 | -9.32% | **-2.83%** |
 | Qwen | W4A44 | **-6.06%** | -4.42% |
 
+## Long-context PP8192 W4A8 comparison
+
+These runs compare W4A8 throughput before and after SM120-optimized flash attention.
+
+Throughput is tokens per second. Both models used `--nvfp4-w4a8`, batch 4096, ubatch 1024, PP8192, and no token-generation test. The `d` column is the sequence length.
+
+| Model | Configuration | d32000 | d64000 | d96000 |
+|---|---|---:|---:|---:|
+| Gemma 4 31B | Before SM120 optimization | 2597.20 +/- 3.95 | 1722.28 +/- 1.48 | 1314.19 +/- 0.34 |
+| Gemma 4 31B | After SM120 optimization | 2858.33 +/- 2.37 | 2205.31 +/- 1.81 | 1801.62 +/- 0.84 |
+| Gemma 4 31B | Change | +10.05% | +28.05% | +37.09% |
+| Qwen 3.6 27B | Before SM120 optimization | 2652.11 +/- 4.56 | 1911.89 +/- 0.65 | 1487.65 +/- 0.83 |
+| Qwen 3.6 27B | After SM120 optimization | 2750.27 +/- 2.96 | 2198.66 +/- 0.66 | 1861.19 +/- 0.55 |
+| Qwen 3.6 27B | Change | +3.70% | +15.00% | +25.11% |
+
+```powershell
+.\llama-bench.exe -m <model.gguf> --nvfp4-w4a8 -b 4096 -ub 1024 -d 32000,64000,96000 -p 8192 -n 0
+```
+
 ## Reproduction commands
 
 Run the master commands from `F:\llama-cpp\Release`. Run W4A8 and W4A44 from `F:\llama-cpp\alpha` and append the corresponding activation flag.
