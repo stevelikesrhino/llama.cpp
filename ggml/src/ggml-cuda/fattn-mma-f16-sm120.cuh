@@ -34,7 +34,7 @@ struct alignas(8) circular_barriers {
     uint64_t consumed[depth];
 };
 
-struct alignas(1024) barrier_storage {
+struct alignas(8) barrier_storage {
     uint64_t q_ready;
     circular_barriers kv;
     circular_barriers mask;
@@ -85,6 +85,10 @@ static __device__ __forceinline__ void tma_load_4d(
 
 static __device__ __forceinline__ void consumer_sync() {
     asm volatile("bar.sync %0, %1;" :: "n"(barrier_id), "n"(nwarps*WARP_SIZE) : "memory");
+}
+
+static __device__ __forceinline__ float softmax_rescale(const float diff) {
+    return diff >= SOFTMAX_FTZ_THRESHOLD ? expf(diff) : 0.0f;
 }
 
 template<data_layout dl>
@@ -158,14 +162,15 @@ struct shared_layout {
     static constexpr int pipeline_bytes   = q_h2*sizeof(half2) + stream_bytes;
     static constexpr int combine_h2       = nwarps*16*(config<DKQ>::nbatch_combine + 4);
     static constexpr int data_bytes       = pipeline_bytes > combine_h2*int(sizeof(half2)) ? pipeline_bytes : combine_h2*int(sizeof(half2));
-    static constexpr int shared_bytes     = sizeof(barrier_storage) + data_bytes;
+    static constexpr int shared_bytes     = data_bytes + sizeof(barrier_storage);
+    static_assert(data_bytes % alignof(barrier_storage) == 0, "misaligned SM120 attention barriers");
 
-    barrier_storage * barriers;
     half2 * data;
+    barrier_storage * barriers;
 
     __device__ explicit shared_layout(void * smem) {
-        barriers = reinterpret_cast<barrier_storage *>(smem);
-        data = reinterpret_cast<half2 *>(reinterpret_cast<uint8_t *>(smem) + sizeof(barrier_storage));
+        data = reinterpret_cast<half2 *>(smem);
+        barriers = reinterpret_cast<barrier_storage *>(reinterpret_cast<uint8_t *>(smem) + data_bytes);
     }
 
     __device__ __forceinline__ half2 * q() const {
@@ -185,7 +190,7 @@ template<int DKQ, int ncols1, int ncols2>
 static __device__ __forceinline__ void producer(
         const float2 * Q_f2, const float scale,
         const int stride_Q1, const int stride_Q2,
-        const int jt, const int zt_gqa, const int gqa_ratio, const uint3 ne01,
+        const int jt, const int zt_gqa, const int gqa_ratio, const int ne01,
         const int sequence, const int ne33, const int z_KV, const int kb0_start, const int kb0_stop,
         const CUtensorMap * map_k, const CUtensorMap * map_v, const CUtensorMap * map_mask,
         shared_layout<DKQ, ncols1> layout) {
@@ -205,7 +210,7 @@ static __device__ __forceinline__ void producer(
         const int j = jc/ncols2;
         const int c = jc - j*ncols2;
         half2 value = make_half2(0.0f, 0.0f);
-        if (jt*ncols1 + j < int(ne01.z) && zt_gqa*ncols2 + c < gqa_ratio) {
+        if (jt*ncols1 + j < ne01 && zt_gqa*ncols2 + c < gqa_ratio) {
             const float2 q = Q_f2[(jt*ncols1 + j)*stride_Q1 + c*stride_Q2 + k];
             value = scale_h2*make_half2(q.x, q.y);
         }
@@ -258,9 +263,8 @@ static __device__ __forceinline__ void consumer(
         float2 * dstk,
         half2 * dst_parts,
         float2 * dst_meta,
-        const float slope,
         const float logit_softcap,
-        const uint3 ne01,
+        const int ne01,
         const int ne02,
         const int gqa_ratio,
         const int jt,
@@ -358,8 +362,8 @@ static __device__ __forceinline__ void consumer(
                 const int i = (i00 + T_C_KQ::get_j(l0))/2;
                 const int j = (threadIdx.y*cols_per_warp + T_C_KQ::get_i(l0))/ncols2;
                 const float2 tmp = __half22float2(reinterpret_cast<const half2 *>(tile_mask)[j*(nbatch_fa/2) + i]);
-                KQ_C[i00/T_C_KQ::J].x[l0 + 0] += slope*tmp.x;
-                KQ_C[i00/T_C_KQ::J].x[l0 + 1] += slope*tmp.y;
+                KQ_C[i00/T_C_KQ::J].x[l0 + 0] += tmp.x;
+                KQ_C[i00/T_C_KQ::J].x[l0 + 1] += tmp.y;
             }
         }
         mr.pop(mask_slot);
@@ -403,9 +407,8 @@ static __device__ __forceinline__ void consumer(
 #pragma unroll
                 for (int col = 0; col < cols_per_thread; ++col) {
                     const float diff = KQ_max[col] - KQ_max_new[col];
-                    KQ_max_scale[col] = expf(diff);
+                    KQ_max_scale[col] = softmax_rescale(diff);
                     KQ_max[col] = KQ_max_new[col];
-                    *reinterpret_cast<uint32_t *>(&KQ_max_scale[col]) *= diff >= SOFTMAX_FTZ_THRESHOLD;
                     KQ_rowsum[col] = KQ_max_scale[col]*KQ_rowsum[col] + KQ_rowsum_add[col];
                 }
                 if (phase == 0) {
@@ -492,9 +495,8 @@ static __device__ __forceinline__ void consumer(
 #pragma unroll
             for (int col = 0; col < cols_per_thread; ++col) {
                 const float diff = KQ_max[col] - KQ_max_new[col];
-                KQ_max_scale[col] = expf(diff);
+                KQ_max_scale[col] = softmax_rescale(diff);
                 KQ_max[col] = KQ_max_new[col];
-                *reinterpret_cast<uint32_t *>(&KQ_max_scale[col]) *= diff >= SOFTMAX_FTZ_THRESHOLD;
                 KQ_rowsum[col] = KQ_max_scale[col]*KQ_rowsum[col] + KQ_rowsum_add[col];
             }
 #pragma unroll
@@ -548,9 +550,8 @@ static __device__ __forceinline__ void consumer(
             const float sink = sinks_f[jc % ncols2];
             const float KQ_max_new = fmaxf(KQ_max[col], sink);
             const float diff = KQ_max[col] - KQ_max_new;
-            KQ_max_scale[col] = expf(diff);
+            KQ_max_scale[col] = softmax_rescale(diff);
             KQ_max[col] = KQ_max_new;
-            *reinterpret_cast<uint32_t *>(&KQ_max_scale[col]) *= diff >= SOFTMAX_FTZ_THRESHOLD;
             KQ_rowsum[col] = KQ_max_scale[col]*KQ_rowsum[col] + expf(sink - KQ_max_new);
         }
 #pragma unroll
@@ -568,6 +569,9 @@ static __device__ __forceinline__ void consumer(
 
     half2 * tile_out = layout.data;
     constexpr int tile_stride = nbatch_combine + 4;
+
+    // Finish all pipeline reads before its shared memory is reused.
+    consumer_sync();
     const int jc_meta = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(threadIdx.x % 4);
     const float2 meta = make_float2(KQ_max[threadIdx.x % cols_per_thread], KQ_rowsum[threadIdx.x % cols_per_thread]);
     if (threadIdx.x % 4 < cols_per_thread) {
@@ -605,7 +609,7 @@ static __device__ __forceinline__ void consumer(
                 }
                 const int j = jc/ncols2;
                 const int c = jc - j*ncols2;
-                if ((ncols1 > 1 && jt*ncols1 + j >= int(ne01.z)) || (ncols2 > 1 && zt_gqa*ncols2 + c >= gqa_ratio)) {
+                if ((ncols1 > 1 && jt*ncols1 + j >= ne01) || (ncols2 > 1 && zt_gqa*ncols2 + c >= gqa_ratio)) {
                     continue;
                 }
                 const float2 meta = reinterpret_cast<const float2 *>(tile_out)[jc*(tile_stride/2) + nbatch_combine/2];
@@ -628,7 +632,7 @@ static __device__ __forceinline__ void consumer(
     }
 
 #else
-    GGML_UNUSED_VARS(sinks_f, dstk, dst_parts, dst_meta, slope, logit_softcap, ne01, ne02, gqa_ratio, jt, zt_gqa, kb0_stop, layout);
+    GGML_UNUSED_VARS(sinks_f, dstk, dst_parts, dst_meta, logit_softcap, ne01, ne02, gqa_ratio, jt, zt_gqa, kb0_stop, layout);
     NO_DEVICE_CODE;
 #endif
 }
@@ -640,9 +644,8 @@ __global__ __launch_bounds__((nwarps + 1)*WARP_SIZE, 1) void kernel(
         __grid_constant__ const CUtensorMap map_mask,
         const char * Q_ptr, const char * sinks_ptr,
         const int * KV_max_ptr, float * dst_ptr, half * dst_parts_ptr, float2 * dst_meta_ptr,
-        const float scale, const float max_bias, const float m0, const float m1,
-        const uint32_t n_head_log2, const float logit_softcap,
-        const uint3 ne01, const int32_t ne02,
+        const float scale, const float logit_softcap,
+        const int32_t ne01, const int32_t ne02,
         const int32_t nb01, const int32_t nb02, const int32_t nb03,
         const int32_t ne11, const int32_t ne12, const int32_t ne33) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_BLACKWELL && defined(TURING_MMA_AVAILABLE)
@@ -685,28 +688,27 @@ __global__ __launch_bounds__((nwarps + 1)*WARP_SIZE, 1) void kernel(
     const int kb0_stop = int64_t(kb0_total)*(split + 1)/split_k;
     const float2 * Q_f2 = reinterpret_cast<const float2 *>(Q_ptr + int64_t(nb03)*sequence + int64_t(nb02)*zt_Q);
     const float * sinks_f = sinks_ptr && split == 0 ? reinterpret_cast<const float *>(sinks_ptr) + zt_Q : nullptr;
-    float2 * dstk = reinterpret_cast<float2 *>(dst_ptr) + (int64_t(sequence)*ne01.z*ne02 + zt_Q)*(DKQ/2);
+    float2 * dstk = reinterpret_cast<float2 *>(dst_ptr) + (int64_t(sequence)*ne01*ne02 + zt_Q)*(DKQ/2);
     half2 * dst_parts = nullptr;
     float2 * dst_meta = nullptr;
     if constexpr (split_k > 1) {
-        const int64_t row0 = (int64_t(sequence)*ne01.z + jt*ncols1)*ne02 + zt_Q;
+        const int64_t row0 = (int64_t(sequence)*ne01 + jt*ncols1)*ne02 + zt_Q;
         dst_parts = reinterpret_cast<half2 *>(dst_parts_ptr) + (row0*split_k + split)*(DKQ/2);
         dst_meta = dst_meta_ptr + row0*split_k + split;
     }
-    const float slope = get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1);
 
     if (threadIdx.y == nwarps) {
         producer<DKQ, ncols1, ncols2>(Q_f2, scale, nb01/sizeof(float2), nb02/sizeof(float2),
             jt, zt_gqa, gqa_ratio, ne01, sequence, ne33, z_KV, kb0_start, kb0_stop,
             &map_k, &map_v, &map_mask, layout);
     } else {
-        consumer<DKQ, ncols1, ncols2, use_logit_softcap, split_k>(sinks_f, dstk, dst_parts, dst_meta, slope, logit_softcap,
+        consumer<DKQ, ncols1, ncols2, use_logit_softcap, split_k>(sinks_f, dstk, dst_parts, dst_meta, logit_softcap,
             ne01, ne02, gqa_ratio, jt, zt_gqa, kb0_stop - kb0_start, layout);
     }
 
 #else
-    GGML_UNUSED_VARS(Q_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_parts_ptr, dst_meta_ptr, scale, max_bias, m0, m1,
-        n_head_log2, logit_softcap, ne01, ne02, nb01, nb02, nb03, ne11, ne12, ne33, map_k, map_v, map_mask);
+    GGML_UNUSED_VARS(Q_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_parts_ptr, dst_meta_ptr, scale,
+        logit_softcap, ne01, ne02, nb01, nb02, nb03, ne11, ne12, ne33, map_k, map_v, map_mask);
     NO_DEVICE_CODE;
 #endif
 }
@@ -751,14 +753,15 @@ static __global__ void combine_results(
 }
 
 static inline CUtensorMap make_map(
-        void * ptr, const uint64_t (&dims)[4], const uint64_t (&strides)[3], const uint32_t (&box)[4],
-        const CUtensorMapSwizzle swizzle) {
+        const ggml_tensor * tensor, const uint32_t (&box)[4], const CUtensorMapSwizzle swizzle) {
     CUtensorMap map{};
+    const uint64_t dims[4] = {
+        uint64_t(tensor->ne[0]), uint64_t(tensor->ne[1]), uint64_t(tensor->ne[2]), uint64_t(tensor->ne[3])};
+    const uint64_t strides[3] = {tensor->nb[1], tensor->nb[2], tensor->nb[3]};
     const uint32_t element_strides[4] = {1, 1, 1, 1};
-    const CUresult result = cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 4, ptr,
+    CU_CHECK(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 4, tensor->data,
         dims, strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
-        CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    GGML_ASSERT(result == CUDA_SUCCESS);
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     return map;
 }
 
@@ -821,32 +824,19 @@ void launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         int64_t(mask->nb[1]/sizeof(half2)), int64_t(mask->nb[3]/sizeof(half2)), int(mask->ne[3]),
         reinterpret_cast<float *>(dst->data), int(Q->ne[1]), int(Q->ne[2]));
 
-    const uint64_t dims_k[4] = {uint64_t(K->ne[0]), uint64_t(K->ne[1]), uint64_t(K->ne[2]), uint64_t(K->ne[3])};
-    const uint64_t dims_v[4] = {uint64_t(V->ne[0]), uint64_t(V->ne[1]), uint64_t(V->ne[2]), uint64_t(V->ne[3])};
-    const uint64_t dims_m[4] = {uint64_t(mask->ne[0]), uint64_t(mask->ne[1]), uint64_t(mask->ne[2]), uint64_t(mask->ne[3])};
-    const uint64_t strides_k[3] = {K->nb[1], K->nb[2], K->nb[3]};
-    const uint64_t strides_v[3] = {V->nb[1], V->nb[2], V->nb[3]};
-    const uint64_t strides_m[3] = {mask->nb[1], mask->nb[2], mask->nb[3]};
     const uint32_t box_kv[4] = {chunk_ne, nbatch_fa, 1, 1};
     const uint32_t box_m[4] = {nbatch_fa, ncols1, 1, 1};
-    const CUtensorMap map_k = make_map(K->data, dims_k, strides_k, box_kv, CU_TENSOR_MAP_SWIZZLE_128B);
-    const CUtensorMap map_v = make_map(V->data, dims_v, strides_v, box_kv, CU_TENSOR_MAP_SWIZZLE_128B);
-    const CUtensorMap map_m = make_map(mask->data, dims_m, strides_m, box_m, CU_TENSOR_MAP_SWIZZLE_NONE);
+    const CUtensorMap map_k = make_map(K, box_kv, CU_TENSOR_MAP_SWIZZLE_128B);
+    const CUtensorMap map_v = make_map(V, box_kv, CU_TENSOR_MAP_SWIZZLE_128B);
+    const CUtensorMap map_m = make_map(mask, box_m, CU_TENSOR_MAP_SWIZZLE_NONE);
 
     float scale = 1.0f;
-    float max_bias = 0.0f;
     float logit_softcap = 0.0f;
     memcpy(&scale, reinterpret_cast<const float *>(dst->op_params) + 0, sizeof(float));
-    memcpy(&max_bias, reinterpret_cast<const float *>(dst->op_params) + 1, sizeof(float));
     memcpy(&logit_softcap, reinterpret_cast<const float *>(dst->op_params) + 2, sizeof(float));
     if (logit_softcap != 0.0f) {
         scale /= logit_softcap;
     }
-    const uint32_t n_head = Q->ne[2];
-    const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
-    const float m0 = powf(2.0f, -max_bias/n_head_log2);
-    const float m1 = powf(2.0f, -(max_bias/2.0f)/n_head_log2);
-    const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
     const int gqa_ratio = Q->ne[2]/K->ne[2];
     const int ntiles_z_gqa = (gqa_ratio + ncols2 - 1)/ncols2;
     int split_k = 1;
@@ -868,37 +858,24 @@ void launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const dim3 threads(WARP_SIZE, nwarps + 1, 1);
     constexpr size_t shared_bytes = shared_layout<DKQ, ncols1>::shared_bytes;
 
-    if (logit_softcap == 0.0f) {
-        auto fn = kernel<DKQ, ncols1, ncols2, false, 1>;
-        if constexpr (DKQ == 256 || DKQ == 512) {
-            if (split_k == 3) {
-                fn = kernel<DKQ, ncols1, ncols2, false, 3>;
-            }
-        }
-        CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
-        const ggml_cuda_kernel_launch_params params(blocks, threads, shared_bytes, stream);
-        ggml_cuda_kernel_launch(fn, params,
-            map_k, map_v, map_m,
-            reinterpret_cast<const char *>(Q->data), sinks ? reinterpret_cast<const char *>(sinks->data) : nullptr,
-            KV_max.ptr, reinterpret_cast<float *>(dst->data), dst_parts.ptr, dst_meta.ptr, scale, max_bias, m0, m1, n_head_log2, logit_softcap,
-            ne01, int32_t(Q->ne[2]), int32_t(Q->nb[1]), int32_t(Q->nb[2]), int32_t(Q->nb[3]),
-            int32_t(K->ne[1]), int32_t(K->ne[2]), int32_t(mask->ne[3]));
-    } else {
-        auto fn = kernel<DKQ, ncols1, ncols2, true, 1>;
-        if constexpr (DKQ == 256 || DKQ == 512) {
-            if (split_k == 3) {
-                fn = kernel<DKQ, ncols1, ncols2, true, 3>;
-            }
-        }
-        CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
-        const ggml_cuda_kernel_launch_params params(blocks, threads, shared_bytes, stream);
-        ggml_cuda_kernel_launch(fn, params,
-            map_k, map_v, map_m,
-            reinterpret_cast<const char *>(Q->data), sinks ? reinterpret_cast<const char *>(sinks->data) : nullptr,
-            KV_max.ptr, reinterpret_cast<float *>(dst->data), dst_parts.ptr, dst_meta.ptr, scale, max_bias, m0, m1, n_head_log2, logit_softcap,
-            ne01, int32_t(Q->ne[2]), int32_t(Q->nb[1]), int32_t(Q->nb[2]), int32_t(Q->nb[3]),
-            int32_t(K->ne[1]), int32_t(K->ne[2]), int32_t(mask->ne[3]));
+    auto fn = kernel<DKQ, ncols1, ncols2, false, 1>;
+    if (logit_softcap != 0.0f) {
+        fn = kernel<DKQ, ncols1, ncols2, true, 1>;
     }
+    if constexpr (DKQ == 256 || DKQ == 512) {
+        if (split_k == 3) {
+            fn = logit_softcap == 0.0f ?
+                kernel<DKQ, ncols1, ncols2, false, 3> : kernel<DKQ, ncols1, ncols2, true, 3>;
+        }
+    }
+    CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes));
+    const ggml_cuda_kernel_launch_params params(blocks, threads, shared_bytes, stream);
+    ggml_cuda_kernel_launch(fn, params,
+        map_k, map_v, map_m,
+        reinterpret_cast<const char *>(Q->data), sinks ? reinterpret_cast<const char *>(sinks->data) : nullptr,
+        KV_max.ptr, reinterpret_cast<float *>(dst->data), dst_parts.ptr, dst_meta.ptr, scale, logit_softcap,
+        int32_t(Q->ne[1]), int32_t(Q->ne[2]), int32_t(Q->nb[1]), int32_t(Q->nb[2]), int32_t(Q->nb[3]),
+        int32_t(K->ne[1]), int32_t(K->ne[2]), int32_t(mask->ne[3]));
 
     if (split_k == 3) {
         const dim3 blocks_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
